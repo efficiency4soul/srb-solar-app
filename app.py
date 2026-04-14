@@ -293,12 +293,25 @@ def merge_with_nasa(pvgis_percentile_df: pd.DataFrame, nasa_df: pd.DataFrame) ->
     return merged
 
 
+def _remove_timezone_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in df.columns:
+        col_dtype = df[col].dtype
+        if pd.api.types.is_datetime64tz_dtype(col_dtype):
+            df[col] = df[col].dt.tz_localize(None)
+    return df
+
+
 def to_excel_bytes(output_df: pd.DataFrame, pvgis_raw: pd.DataFrame, nasa_raw: pd.DataFrame, meta: Dict) -> bytes:
+    output_df_excel = _remove_timezone_for_excel(output_df)
+    pvgis_raw_excel = _remove_timezone_for_excel(pvgis_raw)
+    nasa_raw_excel = _remove_timezone_for_excel(nasa_raw)
+
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        output_df.to_excel(writer, sheet_name="OUTPUT", index=False)
-        pvgis_raw.to_excel(writer, sheet_name="PVGIS_RAW", index=False)
-        nasa_raw.to_excel(writer, sheet_name="NASA_RAW", index=False)
+        output_df_excel.to_excel(writer, sheet_name="OUTPUT", index=False)
+        pvgis_raw_excel.to_excel(writer, sheet_name="PVGIS_RAW", index=False)
+        nasa_raw_excel.to_excel(writer, sheet_name="NASA_RAW", index=False)
         meta_df = pd.DataFrame([{"chiave": k, "valore": json.dumps(v) if isinstance(v, (dict, list)) else v} for k, v in meta.items()])
         meta_df.to_excel(writer, sheet_name="META", index=False)
     buffer.seek(0)
