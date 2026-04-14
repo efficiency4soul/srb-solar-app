@@ -8,7 +8,7 @@ import hashlib
 from email.message import EmailMessage
 from io import BytesIO
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -16,15 +16,22 @@ import streamlit as st
 
 APP_TITLE = "SRB Solar Production App"
 DB_PATH = "users.db"
-PVGIS_BASE_URL = "https://re.jrc.ec.europa.eu/api/v5_2/seriescalc"
+PVGIS_BASE_URL = "https://re.jrc.ec.europa.eu/api/v5_3/seriescalc"
 NASA_BASE_URL = "https://power.larc.nasa.gov/api/temporal/hourly/point"
 DEFAULT_OUTPUT_NAME = "srb_solar_output.xlsx"
 REQUEST_TIMEOUT = 60
+PVGIS_DB_YEAR_LIMITS = {
+    "PVGIS-SARAH2": (2005, 2020),
+    "PVGIS-SARAH3": (2005, 2023),
+    "PVGIS-ERA5": (2005, 2023),
+    "PVGIS-SARAH": (2005, 2016),
+}
+
 
 # ----------------------------
 # Authentication helpers
 # ----------------------------
-def hash_password(password: str, salt: str | None = None) -> str:
+def hash_password(password: str, salt: Optional[str] = None) -> str:
     salt = salt or secrets.token_hex(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
     return f"{salt}${dk.hex()}"
@@ -71,7 +78,7 @@ def init_db() -> None:
     conn.close()
 
 
-def authenticate(username: str, password: str) -> Dict | None:
+def authenticate(username: str, password: str) -> Optional[Dict]:
     conn = get_conn()
     row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
     conn.close()
@@ -96,6 +103,37 @@ def create_user(username: str, email: str, password: str, is_admin: bool = False
         "INSERT INTO users (username, email, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)",
         (username, email, hash_password(password), int(is_admin), datetime.utcnow().isoformat()),
     )
+    conn.commit()
+    conn.close()
+
+
+def update_user(user_id: int, username: str, email: str, is_admin: bool, password: str = "") -> None:
+    conn = get_conn()
+    current = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if current is None:
+        conn.close()
+        raise ValueError("Utente non trovato.")
+
+    if password.strip():
+        conn.execute(
+            "UPDATE users SET username = ?, email = ?, is_admin = ?, password_hash = ? WHERE id = ?",
+            (username, email, int(is_admin), hash_password(password), user_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE users SET username = ?, email = ?, is_admin = ? WHERE id = ?",
+            (username, email, int(is_admin), user_id),
+        )
+    conn.commit()
+    conn.close()
+
+
+def delete_user(user_id: int, acting_user_id: int) -> None:
+    if user_id == acting_user_id:
+        raise ValueError("Non puoi cancellare l'utenza con cui sei connesso.")
+
+    conn = get_conn()
+    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -155,6 +193,11 @@ def normalize_pvgis_raddatabase(selected: str) -> str:
         "PVGIS-ERA5": "PVGIS-ERA5",
     }
     return mapping.get(selected, selected)
+
+
+def get_db_year_limits(raddatabase: str) -> Tuple[int, int]:
+    normalized = normalize_pvgis_raddatabase(raddatabase)
+    return PVGIS_DB_YEAR_LIMITS.get(normalized, (2005, 2023))
 
 
 def build_pvgis_params(cfg: Dict) -> Dict:
@@ -251,7 +294,7 @@ def fetch_nasa_hourly(cfg: Dict, lat: float, lon: float) -> pd.DataFrame:
 # ----------------------------
 # Transformation helpers
 # ----------------------------
-def pick_percentile_value(percentile: int | float) -> float:
+def pick_percentile_value(percentile: float) -> float:
     p = float(percentile)
     if p > 1:
         p = p / 100.0
@@ -260,7 +303,7 @@ def pick_percentile_value(percentile: int | float) -> float:
     return p
 
 
-def aggregate_pvgis_percentile(df: pd.DataFrame, percentile: int | float, plant_code: str) -> pd.DataFrame:
+def aggregate_pvgis_percentile(df: pd.DataFrame, percentile: float, plant_code: str) -> pd.DataFrame:
     p = pick_percentile_value(percentile)
     numeric_cols = [c for c in df.columns if c not in {"time", "timestamp_utc", "year", "month", "day", "hour", "mdh_key"}]
     numeric_cols = [c for c in numeric_cols if pd.api.types.is_numeric_dtype(df[c])]
@@ -297,7 +340,7 @@ def _remove_timezone_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in df.columns:
         col_dtype = df[col].dtype
-        if pd.api.types.is_datetime64tz_dtype(col_dtype):
+        if isinstance(col_dtype, pd.DatetimeTZDtype):
             df[col] = df[col].dt.tz_localize(None)
     return df
 
@@ -341,30 +384,77 @@ def login_ui() -> None:
 def admin_ui() -> None:
     st.markdown("---")
     st.subheader("Amministrazione utenti")
-    with st.form("create_user_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            new_username = st.text_input("Nuovo account")
-            new_email = st.text_input("Email")
-        with col2:
-            new_password = st.text_input("Password iniziale", type="password")
-            new_is_admin = st.checkbox("Utente amministratore")
-        create_submitted = st.form_submit_button("Crea utente e invia credenziali")
 
-    if create_submitted:
-        try:
-            create_user(new_username.strip(), new_email.strip(), new_password, new_is_admin)
-            ok, message = send_credentials_email(new_username.strip(), new_email.strip(), new_password)
-            if ok:
-                st.success(message)
-            else:
-                st.warning(message)
-        except sqlite3.IntegrityError:
-            st.error("Username già presente.")
-        except Exception as exc:
-            st.error(f"Errore nella creazione utente: {exc}")
+    with st.expander("Crea nuova utenza", expanded=False):
+        with st.form("create_user_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                new_username = st.text_input("Nuovo account")
+                new_email = st.text_input("Email")
+            with col2:
+                new_password = st.text_input("Password iniziale", type="password")
+                new_is_admin = st.checkbox("Utente amministratore")
+            create_submitted = st.form_submit_button("Crea utente e invia credenziali")
 
-    st.dataframe(list_users(), use_container_width=True)
+        if create_submitted:
+            try:
+                create_user(new_username.strip(), new_email.strip(), new_password, new_is_admin)
+                ok, message = send_credentials_email(new_username.strip(), new_email.strip(), new_password)
+                if ok:
+                    st.success(message)
+                else:
+                    st.warning(message)
+            except sqlite3.IntegrityError:
+                st.error("Username già presente.")
+            except Exception as exc:
+                st.error(f"Errore nella creazione utente: {exc}")
+
+    users_df = list_users()
+    st.dataframe(users_df, use_container_width=True)
+
+    with st.expander("Modifica o cancella utenza", expanded=False):
+        if users_df.empty:
+            st.info("Nessuna utenza disponibile.")
+        else:
+            username_options = {f"{row['username']} ({row['email']})": int(row['id']) for _, row in users_df.iterrows()}
+            selected_label = st.selectbox("Seleziona utenza", list(username_options.keys()))
+            selected_id = username_options[selected_label]
+            selected_row = users_df.loc[users_df["id"] == selected_id].iloc[0]
+
+            with st.form("edit_user_form"):
+                e1, e2 = st.columns(2)
+                with e1:
+                    edit_username = st.text_input("Username", value=str(selected_row["username"]))
+                    edit_email = st.text_input("Email", value=str(selected_row["email"]))
+                with e2:
+                    edit_password = st.text_input("Nuova password (lascia vuoto per non cambiarla)", type="password")
+                    edit_is_admin = st.checkbox("Utente amministratore", value=bool(selected_row["is_admin"]))
+
+                save_col, delete_col = st.columns(2)
+                with save_col:
+                    save_submitted = st.form_submit_button("Salva modifiche")
+                with delete_col:
+                    delete_submitted = st.form_submit_button("Cancella utenza")
+
+            if save_submitted:
+                try:
+                    update_user(selected_id, edit_username.strip(), edit_email.strip(), edit_is_admin, edit_password)
+                    if st.session_state["user"].get("id") == selected_id:
+                        st.session_state["user"] = authenticate(edit_username.strip(), edit_password or st.session_state["user"].get("password_plain", "")) or st.session_state["user"]
+                    st.success("Utenza aggiornata correttamente.")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("Username già presente.")
+                except Exception as exc:
+                    st.error(f"Errore nell'aggiornamento utente: {exc}")
+
+            if delete_submitted:
+                try:
+                    delete_user(selected_id, int(st.session_state["user"]["id"]))
+                    st.success("Utenza cancellata correttamente.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Errore nella cancellazione utente: {exc}")
 
 
 def app_ui() -> None:
@@ -398,22 +488,24 @@ def app_ui() -> None:
             peakpower = st.number_input("Peak power [kWp]", min_value=0.0, value=1.0, step=0.1)
             loss = st.number_input("Loss [%]", min_value=0.0, max_value=100.0, value=14.0, step=0.5)
         with c2:
-            pvtechchoice = st.selectbox("Tecnologia pannello", ["crystSi", "CIS", "CdTe", "Unknown"], index=0)
+            pvtechchoice = st.selectbox("Tecnologia pannello", ["crystSi", "crystSi2025", "CIS", "CdTe", "Unknown"], index=0)
             mountingplace = st.selectbox("Tipo di montaggio", ["free", "building"], index=0)
             optimalangles = st.checkbox("Optimal angles", value=False)
             angle = st.number_input("Angle [°]", min_value=0.0, max_value=90.0, value=30.0, step=1.0)
             aspect = st.number_input("Aspect [°]", min_value=-180.0, max_value=180.0, value=0.0, step=1.0)
         with c3:
+            raddatabase = st.selectbox("Radiation database", ["PVGIS-SARAH3", "PVGIS-SARAH2", "PVGIS-ERA5", "PVGIS-SARAH"], index=0)
+            db_year_min, db_year_max = get_db_year_limits(raddatabase)
             tracking_mode = st.selectbox(
                 "Tracking",
                 ["fixed", "trackingtype_horizontal", "trackingtype_tilted", "trackingtype_biaxial"],
                 index=0,
             )
-            raddatabase = st.selectbox("Radiation database", ["PVGIS-SARAH2", "PVGIS-SARAH3", "PVGIS-ERA5", "PVGIS-SARAH"], index=0)
-            startyear = st.number_input("Anno iniziale", min_value=2005, max_value=2025, value=2005, step=1)
-            endyear = st.number_input("Anno finale", min_value=2005, max_value=2025, value=2023, step=1)
+            startyear = st.number_input("Anno iniziale", min_value=db_year_min, max_value=db_year_max, value=db_year_min, step=1)
+            endyear = st.number_input("Anno finale", min_value=db_year_min, max_value=db_year_max, value=db_year_max, step=1)
             usehorizon = st.checkbox("Use horizon", value=True)
             components = st.checkbox("Radiation components", value=True)
+            st.caption(f"Range disponibile per {raddatabase}: {db_year_min}–{db_year_max}")
 
         st.markdown("### Sezione B — Configurazione NASA POWER")
         nasa_parameters = st.multiselect(
@@ -455,6 +547,10 @@ def app_ui() -> None:
             if not nasa_parameters:
                 raise ValueError("Seleziona almeno un parametro NASA POWER.")
 
+            db_min, db_max = get_db_year_limits(raddatabase)
+            if startyear < db_min or endyear > db_max:
+                raise ValueError(f"Per {raddatabase} gli anni consentiti sono da {db_min} a {db_max}.")
+
             pvgis_cfg = {
                 "codice_impianto": codice_impianto,
                 "lat": lat,
@@ -479,19 +575,28 @@ def app_ui() -> None:
                 "end_date": nasa_end_date,
             }
 
-            with st.spinner("Scarico dati PVGIS..."):
-                pvgis_raw = fetch_pvgis_hourly(pvgis_cfg)
+            progress = st.progress(0, text="Preparazione elaborazione...")
+            status = st.empty()
 
-            with st.spinner("Scarico dati NASA POWER..."):
-                nasa_raw = fetch_nasa_hourly(nasa_cfg, lat=lat, lon=lon)
+            status.info("1/4 — Scarico dati PVGIS")
+            pvgis_raw = fetch_pvgis_hourly(pvgis_cfg)
+            progress.progress(25, text="PVGIS completato")
 
-            with st.spinner("Elaboro percentile e allineo i dati..."):
-                pvgis_output = aggregate_pvgis_percentile(pvgis_raw, percentile=percentile, plant_code=codice_impianto)
-                final_output = merge_with_nasa(pvgis_output, nasa_raw)
+            status.info("2/4 — Scarico dati NASA POWER")
+            nasa_raw = fetch_nasa_hourly(nasa_cfg, lat=lat, lon=lon)
+            progress.progress(50, text="NASA completato")
+
+            status.info("3/4 — Calcolo percentile PVGIS")
+            pvgis_output = aggregate_pvgis_percentile(pvgis_raw, percentile=float(percentile), plant_code=codice_impianto)
+            progress.progress(75, text="Percentile completato")
+
+            status.info("4/4 — Allineamento dati e generazione Excel")
+            final_output = merge_with_nasa(pvgis_output, nasa_raw)
 
             meta = {
                 "generated_at_utc": datetime.utcnow().isoformat(),
                 "user": user["username"],
+                "pvgis_api_version": "v5_3",
                 "pvgis_config": pvgis_cfg,
                 "nasa_config": {
                     **nasa_cfg,
@@ -502,7 +607,8 @@ def app_ui() -> None:
             }
 
             excel_bytes = to_excel_bytes(final_output, pvgis_raw, nasa_raw, meta)
-            st.success("Elaborazione completata.")
+            progress.progress(100, text="Elaborazione completata")
+            status.success("Elaborazione completata correttamente.")
             st.dataframe(final_output.head(50), use_container_width=True)
             st.download_button(
                 "Scarica Excel di output",
