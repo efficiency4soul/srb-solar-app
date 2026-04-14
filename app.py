@@ -530,13 +530,28 @@ def load_monitoring_file(uploaded_file) -> pd.DataFrame:
     return df
 
 
-def prepare_monitoring_df(raw_df: pd.DataFrame, ts_col: str, prod_col: str) -> pd.DataFrame:
+def prepare_monitoring_df(raw_df: pd.DataFrame, ts_col: str, prod_col: str, peakpower_kwp: float) -> pd.DataFrame:
     df = raw_df.copy()
     df["timestamp_utc"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
     df["measured_energy_kwh"] = pd.to_numeric(df[prod_col], errors="coerce")
     df = df.dropna(subset=["timestamp_utc"]).copy()
     df = add_common_time_columns(df)
-    return df[["timestamp_utc", "month", "day", "hour", "mdh_key", "measured_energy_kwh"]]
+    df = df[["timestamp_utc", "month", "day", "hour", "mdh_key", "measured_energy_kwh"]].dropna(subset=["measured_energy_kwh"])
+
+    if df.empty:
+        raise ValueError("La colonna selezionata per la produzione misurata non contiene valori numerici validi.")
+
+    median_val = float(pd.to_numeric(df["measured_energy_kwh"], errors="coerce").median())
+    max_val = float(pd.to_numeric(df["measured_energy_kwh"], errors="coerce").max())
+    plausible_hourly_limit = max(10.0, float(peakpower_kwp) * 3.0)
+
+    if median_val > plausible_hourly_limit or max_val > plausible_hourly_limit * 10:
+        raise ValueError(
+            "La colonna selezionata come produzione misurata non sembra essere espressa in kWh orari. "
+            "Probabilmente hai scelto una colonna timestamp o un identificativo numerico."
+        )
+
+    return df
 
 
 def compare_expected_vs_measured(expected_df: pd.DataFrame, monitoring_df: Optional[pd.DataFrame], baseline_df: pd.DataFrame) -> pd.DataFrame:
@@ -896,12 +911,24 @@ def app_ui() -> None:
             status.info("4/5 - Carico il file di monitoraggio e chiedo il mapping colonne")
             monitoring_raw = load_monitoring_file(monitoring_file)
             st.subheader("Mapping colonne monitoraggio")
+            candidate_ts_cols = monitoring_raw.columns.tolist()
+            candidate_prod_cols = [
+                c for c in monitoring_raw.columns
+                if pd.api.types.is_numeric_dtype(monitoring_raw[c])
+                or any(token in c.lower() for token in ["energy", "energia", "kwh", "power", "potenza", "prod"])
+            ]
+            if not candidate_prod_cols:
+                candidate_prod_cols = monitoring_raw.columns.tolist()
+
+            default_ts_idx = candidate_ts_cols.index("timestamp_utc") if "timestamp_utc" in candidate_ts_cols else 0
+            default_prod_idx = candidate_prod_cols.index("measured_energy_kwh") if "measured_energy_kwh" in candidate_prod_cols else 0
+
             m1, m2 = st.columns(2)
             with m1:
-                ts_col = st.selectbox("Colonna timestamp", monitoring_raw.columns.tolist(), key="ts_col")
+                ts_col = st.selectbox("Colonna timestamp", candidate_ts_cols, index=default_ts_idx, key="ts_col")
             with m2:
-                prod_col = st.selectbox("Colonna energia/prodotto", monitoring_raw.columns.tolist(), key="prod_col")
-            monitoring_prepared = prepare_monitoring_df(monitoring_raw, ts_col, prod_col)
+                prod_col = st.selectbox("Colonna energia/prodotto [kWh]", candidate_prod_cols, index=default_prod_idx, key="prod_col")
+            monitoring_prepared = prepare_monitoring_df(monitoring_raw, ts_col, prod_col, peakpower_kwp=plant_cfg["peakpower"])
         progress.progress(82, text="Monitoraggio preparato")
 
         status.info("5/5 - Costruisco confronto, KPI ed Excel")
