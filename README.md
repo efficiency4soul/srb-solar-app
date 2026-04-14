@@ -1,83 +1,74 @@
-# SRB Solar Production App
+# SRB Solar Verification App
 
-Web app Streamlit con:
-- autenticazione semplice con account/password
-- pannello admin per creazione utenti
-- invio credenziali via email al momento della creazione
-- chiamate a PVGIS JRC e NASA POWER
-- calcolo percentile orario PVGIS sul periodo selezionato
-- allineamento dei dati NASA sui riferimenti orari mese-giorno-ora
-- export Excel `srb_solar_output.xlsx`
+Web app Streamlit per verificare la produzione misurata di un impianto FV confrontandola con:
 
-## Avvio rapido
+1. baseline storica PVGIS multi-anno
+2. meteo reale recente
+3. produzione attesa recente calcolata dall'irraggiamento
+
+## Struttura funzionale
+
+- **A. Configurazione impianto**
+  - coordinate
+  - potenza di picco
+  - perdite
+  - tecnologia modulo
+  - tilt / azimut / tracking
+- **B. Baseline storica PVGIS**
+  - database radiazione
+  - anni baseline
+  - percentile P10 o P50
+- **C. Meteo reale recente**
+  - Open-Meteo oppure NASA POWER
+  - periodo recente da verificare
+- **D. Dati monitoraggio**
+  - upload CSV/Excel
+  - mapping colonna timestamp
+  - mapping colonna produzione misurata
+- **E. Output**
+  - confronto atteso vs misurato
+  - KPI sintetici
+  - export Excel multi-sheet
+
+## Logica di calcolo
+
+- PVGIS costruisce la baseline storica per ciascun blocco mese-giorno-ora.
+- Open-Meteo o NASA forniscono i dati orari recenti.
+- La produzione attesa recente viene stimata in modo semplificato con:
+
+`E_attesa ≈ Pnom * (irradianza_proxy / 1000) * fattore_temperatura * (1 - loss)`
+
+### Fonte meteo consigliata
+- **Open-Meteo**: consigliata per il confronto recente, perché l'app usa `global_tilted_irradiance` e quindi è più coerente con l'inclinazione dei moduli.
+- **NASA POWER**: disponibile come alternativa, ma nell'app usa una proxy semplice su GHI e quindi è meno robusta per impianti inclinati.
+
+## Fogli Excel prodotti
+
+- `INPUT_CONFIG`
+- `PVGIS_BASELINE_RAW`
+- `PVGIS_BASELINE_PCTL`
+- `RECENT_WEATHER_RAW`
+- `EXPECTED_RECENT`
+- `COMPARISON`
+- `MONITORING_RAW` (se caricato)
+- `KPI_SUMMARY`
+
+## Avvio locale
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Credenziali bootstrap admin
+## Credenziali iniziali
 
-Se il database `users.db` non esiste, al primo avvio viene creato automaticamente un admin iniziale.
-
-Variabili opzionali:
-
-```bash
-export BOOTSTRAP_ADMIN_USERNAME=admin
-export BOOTSTRAP_ADMIN_EMAIL=admin@example.com
-export BOOTSTRAP_ADMIN_PASSWORD=admin123!
-```
-
-Se non imposti nulla, usa questi default temporanei:
 - username: `admin`
 - password: `admin123!`
 
-## Configurazione SMTP per invio credenziali
-
-```bash
-export SMTP_HOST=smtp.example.com
-export SMTP_PORT=587
-export SMTP_USERNAME=user@example.com
-export SMTP_PASSWORD=yourpassword
-export SMTP_SENDER=no-reply@example.com
-export SMTP_USE_TLS=true
-```
-
-Senza SMTP configurato, l'utente viene creato ma l'email non viene inviata.
-
-## Note implementative
-
-### PVGIS
-L'app usa l'endpoint:
-- `https://re.jrc.ec.europa.eu/api/v5_2/seriescalc`
-
-Viene richiesto `outputformat=json` e `pvcalculation=1`.
-
-### NASA POWER
-L'app usa l'endpoint:
-- `https://power.larc.nasa.gov/api/temporal/hourly/point`
-
-Richiede dati orari con `community=RE` e `time-standard=UTC`.
-
-## Struttura output Excel
-
-Foglio `OUTPUT`
-- dati PVGIS aggregati al percentile scelto
-- dati NASA affiancati sulle stesse righe tramite chiave `mese-giorno-ora`
-
-Foglio `PVGIS_RAW`
-- output orario grezzo PVGIS
-
-Foglio `NASA_RAW`
-- output orario grezzo NASA POWER
-
-Foglio `META`
-- parametri usati e metadati di generazione
-
 ## Limiti attuali
 
-- L'invio email richiede SMTP esterno.
-- L'allineamento NASA avviene su chiave `MM-DD HH:00`. Se il periodo NASA non copre tutto l'anno, le ore non presenti restano vuote.
-- Il percentile PVGIS è calcolato su tutte le colonne numeriche restituite dall'API per ciascun `mese-giorno-ora`.
+- il modello di produzione attesa è volutamente semplice e trasparente
+- per NASA POWER l'irraggiamento sul piano non è ricostruito con un modello geometrico completo
+- per validazioni molto rigorose conviene introdurre in futuro un modello POA più avanzato e uno storico elaborazioni in database
