@@ -441,6 +441,11 @@ def build_open_meteo_params(cfg: Dict, lat: float, lon: float, tilt: float, azim
     }
 
 
+def render_request_line(base_url: str, params: Dict) -> str:
+    req = requests.Request("GET", base_url, params=params).prepare()
+    return req.url
+
+
 def fetch_open_meteo_hourly(cfg: Dict, lat: float, lon: float, tilt: float, azimuth: float) -> pd.DataFrame:
     response = requests.get(OPEN_METEO_ARCHIVE_URL, params=build_open_meteo_params(cfg, lat, lon, tilt, azimuth), timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
@@ -878,28 +883,7 @@ def app_ui() -> None:
         with r2:
             recent_end_date = st.date_input("Data finale meteo recente", value=today_minus_7)
 
-        st.caption(
-            f"I parametri geometrici e temporali della richiesta vengono ereditati dalla configurazione già compilata: "
-            f"lat={lat}, lon={lon}, periodo={recent_start_date} → {recent_end_date}, tilt={angle}°, azimut={aspect}°."
-        )
-
         if source_name == "Open-Meteo":
-            st.markdown("#### Configurazione Open-Meteo")
-            st.info(
-                "Open-Meteo usa automaticamente coordinate, periodo, tilt e azimut già inseriti sopra. "
-                "Qui devi scegliere solo le misure orarie da scaricare."
-            )
-            st.write("**Parametri usati automaticamente**")
-            st.json({
-                "latitude": float(lat),
-                "longitude": float(lon),
-                "start_date": str(recent_start_date),
-                "end_date": str(recent_end_date),
-                "timezone": "GMT",
-                "tilt": float(angle),
-                "azimuth": float(aspect),
-            })
-
             open_meteo_hourly_variables = st.multiselect(
                 "Misure orarie da scaricare (Open-Meteo)",
                 options=list(OPEN_METEO_VARIABLE_LABELS.keys()),
@@ -910,22 +894,6 @@ def app_ui() -> None:
             )
             nasa_parameters = []
         else:
-            st.markdown("#### Configurazione NASA POWER")
-            st.info(
-                "NASA POWER usa automaticamente coordinate e periodo già inseriti sopra. "
-                "L'orario viene richiesto in UTC. Qui devi scegliere solo le misure orarie da scaricare."
-            )
-            st.write("**Parametri usati automaticamente**")
-            st.json({
-                "latitude": float(lat),
-                "longitude": float(lon),
-                "start": recent_start_date.strftime("%Y%m%d"),
-                "end": recent_end_date.strftime("%Y%m%d"),
-                "community": "RE",
-                "format": "JSON",
-                "time-standard": "UTC",
-            })
-
             nasa_parameters = st.multiselect(
                 "Misure orarie da scaricare (NASA POWER)",
                 options=list(NASA_PARAMETER_LABELS.keys()),
@@ -974,8 +942,26 @@ def app_ui() -> None:
         progress = st.progress(0, text="Validazione input completata")
         status = st.empty()
 
-        status.info("1/5 - Scarico baseline PVGIS")
         pvgis_cfg = dict(plant_cfg)
+        pvgis_cfg.update({"startyear": baseline_cfg["startyear"], "endyear": baseline_cfg["endyear"]})
+
+        if source_name == "Open-Meteo":
+            meteo_request_params = build_open_meteo_params(recent_cfg, plant_cfg["lat"], plant_cfg["lon"], plant_cfg["angle"], plant_cfg["aspect"])
+            meteo_request_line = render_request_line(OPEN_METEO_ARCHIVE_URL, meteo_request_params)
+        else:
+            nasa_cfg = {
+                "parameters": recent_cfg["nasa_parameters"],
+                "start_date": recent_cfg["start_date"],
+                "end_date": recent_cfg["end_date"],
+            }
+            meteo_request_params = build_nasa_params(nasa_cfg, plant_cfg["lat"], plant_cfg["lon"])
+            meteo_request_line = render_request_line(NASA_BASE_URL, meteo_request_params)
+
+        st.subheader("Traccia chiamate API")
+        st.code(render_request_line(PVGIS_BASE_URL, build_pvgis_params(pvgis_cfg)), language=None)
+        st.code(meteo_request_line, language=None)
+
+        status.info("1/5 - Scarico baseline PVGIS")
         pvgis_cfg.update({"startyear": baseline_cfg["startyear"], "endyear": baseline_cfg["endyear"]})
         baseline_raw = fetch_pvgis_hourly(pvgis_cfg)
         baseline_percentile = aggregate_pvgis_baseline(baseline_raw, percentile=baseline_cfg["percentile"], plant_code=plant_cfg["codice_impianto"])
@@ -985,11 +971,6 @@ def app_ui() -> None:
         if source_name == "Open-Meteo":
             recent_weather_raw = fetch_open_meteo_hourly(recent_cfg, plant_cfg["lat"], plant_cfg["lon"], plant_cfg["angle"], plant_cfg["aspect"])
         else:
-            nasa_cfg = {
-                "parameters": recent_cfg["nasa_parameters"],
-                "start_date": recent_cfg["start_date"],
-                "end_date": recent_cfg["end_date"],
-            }
             recent_weather_raw = fetch_nasa_hourly(nasa_cfg, plant_cfg["lat"], plant_cfg["lon"])
         progress.progress(45, text="Meteo recente scaricato")
 
