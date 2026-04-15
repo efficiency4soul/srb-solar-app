@@ -871,58 +871,67 @@ def app_ui() -> None:
         percentile = st.selectbox("Percentile baseline", [10, 50], index=1)
 
         st.markdown("### C. Meteo reale recente")
-        source_name = st.selectbox("Fonte meteo recente", ["Open-Meteo", "NASA POWER"], index=0)
+        source_name = st.selectbox("Fonte meteo recente", ["Open-Meteo", "NASA POWER"], index=0, key="weather_source")
         r1, r2 = st.columns(2)
         with r1:
             recent_start_date = st.date_input("Data iniziale meteo recente", value=default_recent_start)
         with r2:
             recent_end_date = st.date_input("Data finale meteo recente", value=today_minus_7)
 
+        st.caption(
+            f"I parametri geometrici e temporali della richiesta vengono ereditati dalla configurazione già compilata: "
+            f"lat={lat}, lon={lon}, periodo={recent_start_date} → {recent_end_date}, tilt={angle}°, azimut={aspect}°."
+        )
+
         if source_name == "Open-Meteo":
-            st.markdown("#### Parametri obbligatori Open-Meteo")
-            om1, om2, om3 = st.columns(3)
-            with om1:
-                st.text_input("latitude", value=str(lat), disabled=True)
-                st.text_input("start_date", value=str(recent_start_date), disabled=True)
-                st.text_input("timezone", value="UTC/GMT", disabled=True)
-            with om2:
-                st.text_input("longitude", value=str(lon), disabled=True)
-                st.text_input("end_date", value=str(recent_end_date), disabled=True)
-                st.text_input("tilt", value=str(angle), disabled=True)
-            with om3:
-                st.text_input("hourly", value="selezione variabili orarie", disabled=True)
-                st.text_input("azimuth", value=str(aspect), disabled=True)
-                st.caption("GTI richiede tilt e azimuth.")
+            st.markdown("#### Configurazione Open-Meteo")
+            st.info(
+                "Open-Meteo usa automaticamente coordinate, periodo, tilt e azimut già inseriti sopra. "
+                "Qui devi scegliere solo le misure orarie da scaricare."
+            )
+            st.write("**Parametri usati automaticamente**")
+            st.json({
+                "latitude": float(lat),
+                "longitude": float(lon),
+                "start_date": str(recent_start_date),
+                "end_date": str(recent_end_date),
+                "timezone": "GMT",
+                "tilt": float(angle),
+                "azimuth": float(aspect),
+            })
 
             open_meteo_hourly_variables = st.multiselect(
-                "Variabili Open-Meteo orarie",
-                list(OPEN_METEO_VARIABLE_LABELS.keys()),
+                "Misure orarie da scaricare (Open-Meteo)",
+                options=list(OPEN_METEO_VARIABLE_LABELS.keys()),
                 default=OPEN_METEO_RECOMMENDED_DEFAULT,
                 format_func=lambda x: f"{x} — {OPEN_METEO_VARIABLE_LABELS.get(x, x)}",
+                key="open_meteo_vars",
                 help="Per il calcolo produzione tieni almeno global_tilted_irradiance e temperature_2m.",
             )
             nasa_parameters = []
         else:
-            st.markdown("#### Parametri obbligatori NASA POWER")
-            n1, n2, n3 = st.columns(3)
-            with n1:
-                st.text_input("latitude", value=str(lat), disabled=True)
-                st.text_input("start", value=recent_start_date.strftime("%Y%m%d"), disabled=True)
-                st.text_input("community", value="RE", disabled=True)
-            with n2:
-                st.text_input("longitude", value=str(lon), disabled=True)
-                st.text_input("end", value=recent_end_date.strftime("%Y%m%d"), disabled=True)
-                st.text_input("format", value="JSON", disabled=True)
-            with n3:
-                st.text_input("parameters", value="selezione parametri orari", disabled=True)
-                st.text_input("time-standard", value="UTC", disabled=True)
-                st.caption("Con NASA il calcolo usa GHI come proxy, non GTI diretto.")
+            st.markdown("#### Configurazione NASA POWER")
+            st.info(
+                "NASA POWER usa automaticamente coordinate e periodo già inseriti sopra. "
+                "L'orario viene richiesto in UTC. Qui devi scegliere solo le misure orarie da scaricare."
+            )
+            st.write("**Parametri usati automaticamente**")
+            st.json({
+                "latitude": float(lat),
+                "longitude": float(lon),
+                "start": recent_start_date.strftime("%Y%m%d"),
+                "end": recent_end_date.strftime("%Y%m%d"),
+                "community": "RE",
+                "format": "JSON",
+                "time-standard": "UTC",
+            })
 
             nasa_parameters = st.multiselect(
-                "Parametri NASA orari",
-                list(NASA_PARAMETER_LABELS.keys()),
+                "Misure orarie da scaricare (NASA POWER)",
+                options=list(NASA_PARAMETER_LABELS.keys()),
                 default=["ALLSKY_SFC_SW_DWN", "T2M", "WS10M", "ALLSKY_SFC_SW_DNI", "ALLSKY_SFC_SW_DIFF"],
                 format_func=lambda x: f"{x} — {NASA_PARAMETER_LABELS.get(x, x)}",
+                key="nasa_power_vars",
                 help="Per il calcolo produzione tieni almeno ALLSKY_SFC_SW_DWN e T2M.",
             )
             open_meteo_hourly_variables = []
