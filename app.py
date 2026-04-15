@@ -38,13 +38,27 @@ NASA_PARAMETER_LABELS = {
     "WS10M": "Vento 10m",
 }
 
-OPEN_METEO_HOURLY_VARS = [
+OPEN_METEO_VARIABLE_LABELS = {
+    "global_tilted_irradiance": "GTI - Irraggiamento globale sul piano inclinato",
+    "shortwave_radiation": "GHI - Irraggiamento globale orizzontale",
+    "direct_normal_irradiance": "DNI - Irraggiamento normale diretto",
+    "diffuse_radiation": "DHI - Irraggiamento diffuso orizzontale",
+    "temperature_2m": "Temperatura aria 2 m",
+    "wind_speed_10m": "Velocità vento 10 m",
+}
+
+OPEN_METEO_MIN_REQUIRED = [
     "global_tilted_irradiance",
+    "temperature_2m",
+]
+
+OPEN_METEO_RECOMMENDED_DEFAULT = [
+    "global_tilted_irradiance",
+    "temperature_2m",
+    "wind_speed_10m",
     "shortwave_radiation",
     "direct_normal_irradiance",
     "diffuse_radiation",
-    "temperature_2m",
-    "wind_speed_10m",
 ]
 
 TECH_TEMP_COEFF = {
@@ -412,12 +426,13 @@ def fetch_nasa_hourly(cfg: Dict, lat: float, lon: float) -> pd.DataFrame:
 
 
 def build_open_meteo_params(cfg: Dict, lat: float, lon: float, tilt: float, azimuth: float) -> Dict:
+    hourly_vars = cfg.get("open_meteo_hourly_variables", OPEN_METEO_RECOMMENDED_DEFAULT)
     return {
         "latitude": lat,
         "longitude": lon,
         "start_date": cfg["start_date"].isoformat(),
         "end_date": cfg["end_date"].isoformat(),
-        "hourly": ",".join(OPEN_METEO_HOURLY_VARS),
+        "hourly": ",".join(hourly_vars),
         "tilt": tilt,
         "azimuth": azimuth,
         "timezone": "GMT",
@@ -775,6 +790,11 @@ def validation_checks(plant_cfg: Dict, baseline_cfg: Dict, recent_cfg: Dict, sou
         raise ValueError("Longitudine non valida.")
     if source_name == "NASA POWER" and not recent_cfg["nasa_parameters"]:
         raise ValueError("Seleziona almeno un parametro NASA POWER.")
+    if source_name == "Open-Meteo":
+        selected = recent_cfg.get("open_meteo_hourly_variables", [])
+        for required_var in OPEN_METEO_MIN_REQUIRED:
+            if required_var not in selected:
+                raise ValueError(f"Per Open-Meteo seleziona almeno i parametri obbligatori: {', '.join(OPEN_METEO_MIN_REQUIRED)}.")
     if source_name == "PVGIS recente":
         raise ValueError("PVGIS non è adatto ai dati recenti oltre il 2023 in questa app. Usa Open-Meteo o NASA POWER.")
     if not monitoring_present:
@@ -858,12 +878,54 @@ def app_ui() -> None:
         with r2:
             recent_end_date = st.date_input("Data finale meteo recente", value=today_minus_7)
 
-        nasa_parameters = st.multiselect(
-            "Parametri NASA orari",
-            list(NASA_PARAMETER_LABELS.keys()),
-            default=["ALLSKY_SFC_SW_DWN", "ALLSKY_SFC_SW_DNI", "ALLSKY_SFC_SW_DIFF", "T2M", "WS10M"],
-            help="Usato solo se selezioni NASA POWER.",
-        )
+        if source_name == "Open-Meteo":
+            st.markdown("#### Parametri obbligatori Open-Meteo")
+            om1, om2, om3 = st.columns(3)
+            with om1:
+                st.text_input("latitude", value=str(lat), disabled=True)
+                st.text_input("start_date", value=str(recent_start_date), disabled=True)
+                st.text_input("timezone", value="UTC/GMT", disabled=True)
+            with om2:
+                st.text_input("longitude", value=str(lon), disabled=True)
+                st.text_input("end_date", value=str(recent_end_date), disabled=True)
+                st.text_input("tilt", value=str(angle), disabled=True)
+            with om3:
+                st.text_input("hourly", value="selezione variabili orarie", disabled=True)
+                st.text_input("azimuth", value=str(aspect), disabled=True)
+                st.caption("GTI richiede tilt e azimuth.")
+
+            open_meteo_hourly_variables = st.multiselect(
+                "Variabili Open-Meteo orarie",
+                list(OPEN_METEO_VARIABLE_LABELS.keys()),
+                default=OPEN_METEO_RECOMMENDED_DEFAULT,
+                format_func=lambda x: f"{x} — {OPEN_METEO_VARIABLE_LABELS.get(x, x)}",
+                help="Per il calcolo produzione tieni almeno global_tilted_irradiance e temperature_2m.",
+            )
+            nasa_parameters = []
+        else:
+            st.markdown("#### Parametri obbligatori NASA POWER")
+            n1, n2, n3 = st.columns(3)
+            with n1:
+                st.text_input("latitude", value=str(lat), disabled=True)
+                st.text_input("start", value=recent_start_date.strftime("%Y%m%d"), disabled=True)
+                st.text_input("community", value="RE", disabled=True)
+            with n2:
+                st.text_input("longitude", value=str(lon), disabled=True)
+                st.text_input("end", value=recent_end_date.strftime("%Y%m%d"), disabled=True)
+                st.text_input("format", value="JSON", disabled=True)
+            with n3:
+                st.text_input("parameters", value="selezione parametri orari", disabled=True)
+                st.text_input("time-standard", value="UTC", disabled=True)
+                st.caption("Con NASA il calcolo usa GHI come proxy, non GTI diretto.")
+
+            nasa_parameters = st.multiselect(
+                "Parametri NASA orari",
+                list(NASA_PARAMETER_LABELS.keys()),
+                default=["ALLSKY_SFC_SW_DWN", "T2M", "WS10M", "ALLSKY_SFC_SW_DNI", "ALLSKY_SFC_SW_DIFF"],
+                format_func=lambda x: f"{x} — {NASA_PARAMETER_LABELS.get(x, x)}",
+                help="Per il calcolo produzione tieni almeno ALLSKY_SFC_SW_DWN e T2M.",
+            )
+            open_meteo_hourly_variables = []
 
         st.markdown("### D. Dati di monitoraggio")
         monitoring_file = st.file_uploader("Carica CSV o Excel del monitoraggio", type=["csv", "xlsx", "xls"])
@@ -895,6 +957,7 @@ def app_ui() -> None:
             "start_date": recent_start_date,
             "end_date": recent_end_date,
             "nasa_parameters": nasa_parameters,
+            "open_meteo_hourly_variables": open_meteo_hourly_variables,
         }
 
         validation_checks(plant_cfg, baseline_cfg, recent_cfg, source_name, monitoring_file is not None)
