@@ -453,6 +453,13 @@ def aggregate_pvgis_baseline(df: pd.DataFrame, percentile: float, plant_code: st
 
     grouped = df.groupby(["month", "day", "hour"], dropna=False)
     agg = grouped[numeric_cols].quantile(p).reset_index()
+
+    # PVGIS restituisce P in W. Per confronto orario coerente con kWh/misurato,
+    # usiamo anche una colonna energetica equivalente su base oraria.
+    if "P" in agg.columns:
+        agg["baseline_power_w"] = pd.to_numeric(agg["P"], errors="coerce")
+        agg["baseline_energy_kwh"] = agg["baseline_power_w"] / 1000.0
+
     agg["baseline_timestamp_utc"] = pd.to_datetime(
         {"year": 2020, "month": agg["month"], "day": agg["day"], "hour": agg["hour"]},
         utc=True,
@@ -555,9 +562,22 @@ def prepare_monitoring_df(raw_df: pd.DataFrame, ts_col: str, prod_col: str, peak
 
 
 def compare_expected_vs_measured(expected_df: pd.DataFrame, monitoring_df: Optional[pd.DataFrame], baseline_df: pd.DataFrame) -> pd.DataFrame:
-    baseline_small = baseline_df[["mdh_key"] + [c for c in ["P", "G(i)", "Gb(i)", "Gd(i)", "Gr(i)", "H_sun", "T2m", "WS10m"] if c in baseline_df.columns]].copy()
-    baseline_small = baseline_small.add_prefix("baseline_")
-    baseline_small = baseline_small.rename(columns={"baseline_mdh_key": "mdh_key"})
+    baseline_cols = ["mdh_key"]
+    for c in ["baseline_energy_kwh", "baseline_power_w", "G(i)", "Gb(i)", "Gd(i)", "Gr(i)", "H_sun", "T2m", "WS10m"]:
+        if c in baseline_df.columns:
+            baseline_cols.append(c)
+
+    baseline_small = baseline_df[baseline_cols].copy()
+    rename_map = {
+        "G(i)": "baseline_Gi_wm2",
+        "Gb(i)": "baseline_Gb_i_wm2",
+        "Gd(i)": "baseline_Gd_i_wm2",
+        "Gr(i)": "baseline_Gr_i_wm2",
+        "H_sun": "baseline_H_sun_deg",
+        "T2m": "baseline_T2m_c",
+        "WS10m": "baseline_WS10m_ms",
+    }
+    baseline_small = baseline_small.rename(columns=rename_map)
 
     out = expected_df.merge(baseline_small, on="mdh_key", how="left")
 
@@ -970,14 +990,14 @@ def app_ui() -> None:
             c for c in [
                 "timestamp_utc", "expected_energy_kwh", "measured_energy_kwh", "deviation_pct",
                 "performance_ratio_proxy", "irradiance_proxy_wm2", "temp_air_c", "expected_method",
-                "baseline_P", "baseline_G(i)"
+                "baseline_energy_kwh", "baseline_power_w", "baseline_Gi_wm2"
             ] if c in comparison_df.columns
         ]
         st.dataframe(comparison_df[view_cols].head(100), use_container_width=True)
 
         st.subheader("Grafico orario di confronto")
         chart_df = comparison_df.copy().sort_values("timestamp_utc")
-        chart_cols = [c for c in ["expected_energy_kwh", "measured_energy_kwh", "baseline_P"] if c in chart_df.columns]
+        chart_cols = [c for c in ["expected_energy_kwh", "measured_energy_kwh", "baseline_energy_kwh"] if c in chart_df.columns]
         if chart_cols:
             line_df = chart_df[["timestamp_utc"] + chart_cols].set_index("timestamp_utc")
             st.line_chart(line_df, height=360)
@@ -1005,7 +1025,8 @@ def app_ui() -> None:
         with st.expander("Note metodologiche"):
             st.write(
                 "Open-Meteo usa GTI oraria se disponibile; NASA POWER usa GHI come proxy semplice dell'irraggiamento sul piano. "
-                "Il confronto con il misurato è quindi più robusto con Open-Meteo che con NASA, soprattutto per impianti inclinati."
+                "La baseline PVGIS viene convertita da P [W] a baseline_energy_kwh su base oraria dividendo per 1000. "
+                "La produzione attesa recente viene calcolata moltiplicando esplicitamente per la peak power dell'impianto [kWp]."
             )
     except requests.HTTPError as exc:
         body = exc.response.text[:1200] if exc.response is not None else str(exc)
