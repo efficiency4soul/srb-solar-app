@@ -4,7 +4,7 @@ import smtplib
 import ssl
 import secrets
 import hashlib
-import json
+import re
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from io import BytesIO
@@ -197,7 +197,15 @@ def delete_user(user_id: int, acting_user_id: int) -> None:
     conn.close()
 
 
-def save_run_record(username: str, plant_code: str, weather_source: str, percentile: int, output_filename: str, output_bytes: bytes, kpi_df: pd.DataFrame) -> str:
+def save_run_record(
+    username: str,
+    plant_code: str,
+    weather_source: str,
+    percentile: int,
+    output_filename: str,
+    output_bytes: bytes,
+    kpi_df: pd.DataFrame,
+) -> str:
     os.makedirs(RUNS_DIR, exist_ok=True)
     output_path = os.path.join(RUNS_DIR, output_filename)
     with open(output_path, "wb") as f:
@@ -297,9 +305,44 @@ def send_credentials_email(username: str, email: str, password: str) -> Tuple[bo
 # ----------------------------
 def safe_float(value, default=0.0):
     try:
+        if pd.isna(value):
+            return default
         return float(value)
     except Exception:
         return default
+
+
+def safe_int(value, default=0):
+    try:
+        if pd.isna(value):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def parse_bool(value, default=False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return default
+    s = str(value).strip().lower()
+    true_values = {"1", "true", "vero", "yes", "si", "sì", "y", "x"}
+    false_values = {"0", "false", "falso", "no", "n", ""}
+    if s in true_values:
+        return True
+    if s in false_values:
+        return False
+    return default
+
+
+def normalize_text(s: str) -> str:
+    s = "" if s is None else str(s)
+    s = s.strip().lower()
+    s = s.replace("à", "a").replace("è", "e").replace("é", "e").replace("ì", "i").replace("ò", "o").replace("ù", "u")
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
 
 
 def remove_timezone_for_excel(df: pd.DataFrame) -> pd.DataFrame:
@@ -342,6 +385,246 @@ def build_run_filename(plant_code: str, source: str, percentile: int) -> str:
     safe_code = plant_code.replace(" ", "_")
     safe_source = source.replace(" ", "_").replace("/", "_")
     return f"{safe_code}_{safe_source}_P{percentile}_{ts}.xlsx"
+
+
+# ----------------------------
+# Plant workbook parsing
+# ----------------------------
+CONFIG_ALIASES = {
+    "codice_impianto": ["codice_impianto", "impianto", "plant_code", "codice", "site_code", "nome_impianto"],
+    "lat": ["lat", "latitude", "latitudine"],
+    "lon": ["lon", "lng", "longitude", "longitudine"],
+    "peakpower": ["peakpower", "peak_power", "kwp", "potenza_picco_kwp", "potenza_picco", "potenza_nominale_kwp"],
+    "loss": ["loss", "loss_percent", "perdite", "perdite_percento", "losses"],
+    "pvtechchoice": ["pvtechchoice", "pv_tech", "tecnologia_pannello", "tecnologia", "module_technology"],
+    "mountingplace": ["mountingplace", "montaggio", "tipo_montaggio", "installation_type"],
+    "optimalangles": ["optimalangles", "optimal_angles", "angoli_ottimali"],
+    "angle": ["angle", "tilt", "inclinazione", "tilt_deg"],
+    "aspect": ["aspect", "azimuth", "azimut", "azimuth_deg"],
+    "tracking_mode": ["tracking_mode", "tracking", "inseguimento"],
+    "raddatabase": ["raddatabase", "rad_database", "radiation_database", "database_radiazione"],
+    "startyear": ["startyear", "start_year", "anno_iniziale", "baseline_start_year"],
+    "endyear": ["endyear", "end_year", "anno_finale", "baseline_end_year"],
+    "usehorizon": ["usehorizon", "use_horizon", "orizzonte"],
+    "components": ["components", "radiation_components", "componenti_rad"],
+}
+
+MEASURE_ALIASES = {
+    "year": ["anno", "year"],
+    "month": ["mese", "month"],
+    "day": ["giorno", "day"],
+    "hour": ["ora", "hour"],
+    "power_kw": ["potenza_misurata_kw", "potenza_kw", "power_kw", "kw", "potenza"],
+}
+
+
+def detect_sheet_roles(xls: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]:
+    config_sheet = None
+    measure_sheet = None
+
+    for sheet in xls.sheet_names:
+        sample = pd.read_excel(xls, sheet_name=sheet, nrows=20)
+        cols_norm = [normalize_text(c) for c in sample.columns]
+
+        has_measure_cols = (
+            any(c in cols_norm for c in ["anno", "year"])
+            and any(c in cols_norm for c in ["mese", "month"])
+            and any(c in cols_norm for c in ["giorno", "day"])
+            and any(c in cols_norm for c in ["ora", "hour"])
+        )
+
+        sheet_name_norm = normalize_text(sheet)
+
+        if has_measure_cols and measure_sheet is None:
+            measure_sheet = sheet
+
+        if config_sheet is None:
+            if any(token in sheet_name_norm for token in ["config", "impianto", "plant", "setup", "anagrafica"]):
+                config_sheet = sheet
+
+    if config_sheet is None:
+        # fallback: il primo foglio che non sia misure
+        for sheet in xls.sheet_names:
+            if sheet != measure_sheet:
+                config_sheet = sheet
+                break
+
+    return config_sheet, measure_sheet
+
+
+def dataframe_to_key_value(df: pd.DataFrame) -> Dict[str, object]:
+    out = {}
+
+    # caso 1: prime due colonne key/value
+    if df.shape[1] >= 2:
+        c0 = df.columns[0]
+        c1 = df.columns[1]
+        for _, row in df[[c0, c1]].dropna(how="all").iterrows():
+            key = normalize_text(row[c0])
+            if key:
+                out[key] = row[c1]
+
+    # caso 2: una riga con intestazioni = chiavi
+    if df.shape[0] >= 1:
+        first_row = df.iloc[0].to_dict()
+        for k, v in first_row.items():
+            nk = normalize_text(k)
+            if nk and nk not in out and not pd.isna(v):
+                out[nk] = v
+
+    return out
+
+
+def pick_value_from_aliases(data: Dict[str, object], aliases: List[str]):
+    for alias in aliases:
+        n = normalize_text(alias)
+        if n in data:
+            return data[n]
+    return None
+
+
+def parse_plant_config_sheet(df: pd.DataFrame) -> Dict:
+    raw_kv = dataframe_to_key_value(df)
+
+    cfg = {}
+    for target_key, aliases in CONFIG_ALIASES.items():
+        cfg[target_key] = pick_value_from_aliases(raw_kv, aliases)
+
+    # default robusti
+    cfg["codice_impianto"] = cfg["codice_impianto"] or "SRB_xxx"
+    cfg["lat"] = safe_float(cfg["lat"], None)
+    cfg["lon"] = safe_float(cfg["lon"], None)
+    cfg["peakpower"] = safe_float(cfg["peakpower"], 1.0)
+    cfg["loss"] = safe_float(cfg["loss"], 14.0)
+    cfg["pvtechchoice"] = str(cfg["pvtechchoice"]).strip() if cfg["pvtechchoice"] is not None else "crystSi"
+    cfg["mountingplace"] = str(cfg["mountingplace"]).strip() if cfg["mountingplace"] is not None else "free"
+    cfg["optimalangles"] = parse_bool(cfg["optimalangles"], False)
+    cfg["angle"] = safe_float(cfg["angle"], 30.0)
+    cfg["aspect"] = safe_float(cfg["aspect"], 0.0)
+    cfg["tracking_mode"] = str(cfg["tracking_mode"]).strip() if cfg["tracking_mode"] is not None else "fixed"
+    cfg["raddatabase"] = str(cfg["raddatabase"]).strip() if cfg["raddatabase"] is not None else "PVGIS-SARAH3"
+    min_year, max_year = get_db_year_limits(cfg["raddatabase"])
+    cfg["startyear"] = safe_int(cfg["startyear"], min_year)
+    cfg["endyear"] = safe_int(cfg["endyear"], max_year)
+    cfg["usehorizon"] = parse_bool(cfg["usehorizon"], True)
+    cfg["components"] = parse_bool(cfg["components"], True)
+
+    if cfg["lat"] is None or cfg["lon"] is None:
+        raise ValueError("Nel foglio configurazione mancano latitudine e/o longitudine.")
+    return cfg
+
+
+def rename_measurement_columns(df: pd.DataFrame) -> pd.DataFrame:
+    renamed = df.copy()
+    norm_map = {normalize_text(c): c for c in renamed.columns}
+    rename_dict = {}
+
+    for target, aliases in MEASURE_ALIASES.items():
+        for alias in aliases:
+            n = normalize_text(alias)
+            if n in norm_map:
+                rename_dict[norm_map[n]] = target
+                break
+
+    renamed = renamed.rename(columns=rename_dict)
+    return renamed
+
+
+def prepare_measurements_from_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
+    df = rename_measurement_columns(raw_df)
+
+    required = ["year", "month", "day", "hour", "power_kw"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "Il foglio misure deve contenere le colonne anno, mese, giorno, ora e Potenza misurata in kW. "
+            f"Mancano: {', '.join(missing)}"
+        )
+
+    df = df.copy()
+    for c in required:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=required).copy()
+    if df.empty:
+        raise ValueError("Il foglio misure è presente ma non contiene righe valide.")
+
+    df["timestamp_utc"] = pd.to_datetime(
+        dict(
+            year=df["year"].astype(int),
+            month=df["month"].astype(int),
+            day=df["day"].astype(int),
+            hour=df["hour"].astype(int),
+        ),
+        errors="coerce",
+        utc=True,
+    )
+
+    df = df.dropna(subset=["timestamp_utc"]).copy()
+    if df.empty:
+        raise ValueError("Impossibile costruire timestamp validi dal foglio misure.")
+
+    df["measured_power_kw"] = pd.to_numeric(df["power_kw"], errors="coerce").fillna(0.0)
+    df = df.groupby("timestamp_utc", as_index=False)["measured_power_kw"].mean()
+
+    full_index = pd.date_range(
+        start=df["timestamp_utc"].min(),
+        end=df["timestamp_utc"].max(),
+        freq="H",
+        tz="UTC",
+    )
+
+    df = (
+        df.set_index("timestamp_utc")
+        .reindex(full_index)
+        .rename_axis("timestamp_utc")
+        .reset_index()
+    )
+    df["measured_power_kw"] = pd.to_numeric(df["measured_power_kw"], errors="coerce").fillna(0.0)
+
+    # per serie orarie, kW medi dell'ora ~= kWh nell'ora
+    df["measured_energy_kwh"] = df["measured_power_kw"]
+
+    df["year"] = df["timestamp_utc"].dt.year
+    df["month"] = df["timestamp_utc"].dt.month
+    df["day"] = df["timestamp_utc"].dt.day
+    df["hour"] = df["timestamp_utc"].dt.hour
+    df["mdh_key"] = df["timestamp_utc"].dt.strftime("%m-%d %H:00")
+    return df[["timestamp_utc", "year", "month", "day", "hour", "mdh_key", "measured_power_kw", "measured_energy_kwh"]]
+
+
+def load_plant_workbook(uploaded_file) -> Dict:
+    try:
+        xls = pd.ExcelFile(uploaded_file)
+    except Exception as exc:
+        raise ValueError(f"Il file impianto deve essere un Excel leggibile. Dettaglio: {exc}")
+
+    config_sheet, measure_sheet = detect_sheet_roles(xls)
+
+    if config_sheet is None:
+        raise ValueError("File impianto non valido: manca il foglio configurazione.")
+
+    config_df = pd.read_excel(xls, sheet_name=config_sheet)
+    if config_df.empty:
+        raise ValueError("Il foglio configurazione è vuoto.")
+
+    plant_cfg = parse_plant_config_sheet(config_df)
+
+    measurements_df = None
+    measurements_raw = None
+    if measure_sheet is not None:
+        measurements_raw = pd.read_excel(xls, sheet_name=measure_sheet)
+        if not measurements_raw.empty:
+            measurements_df = prepare_measurements_from_sheet(measurements_raw)
+
+    return {
+        "config_sheet_name": config_sheet,
+        "measure_sheet_name": measure_sheet,
+        "config_raw_df": config_df,
+        "measurements_raw_df": measurements_raw,
+        "plant_cfg": plant_cfg,
+        "measurements_df": measurements_df,
+    }
 
 
 # ----------------------------
@@ -474,8 +757,6 @@ def aggregate_pvgis_baseline(df: pd.DataFrame, percentile: float, plant_code: st
     grouped = df.groupby(["month", "day", "hour"], dropna=False)
     agg = grouped[numeric_cols].quantile(p).reset_index()
 
-    # PVGIS restituisce P in W. Per confronto orario coerente con kWh/misurato,
-    # usiamo anche una colonna energetica equivalente su base oraria.
     if "P" in agg.columns:
         agg["baseline_power_w"] = pd.to_numeric(agg["P"], errors="coerce")
         agg["baseline_energy_kwh"] = agg["baseline_power_w"] / 1000.0
@@ -544,43 +825,6 @@ def compute_expected_from_recent_weather(df: pd.DataFrame, plant_cfg: Dict, sour
     return out
 
 
-def load_monitoring_file(uploaded_file) -> pd.DataFrame:
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-    elif name.endswith(".xlsx") or name.endswith(".xls"):
-        df = pd.read_excel(uploaded_file)
-    else:
-        raise ValueError("Formato file monitoraggio non supportato. Usa CSV o Excel.")
-    if df.empty:
-        raise ValueError("Il file di monitoraggio è vuoto.")
-    return df
-
-
-def prepare_monitoring_df(raw_df: pd.DataFrame, ts_col: str, prod_col: str, peakpower_kwp: float) -> pd.DataFrame:
-    df = raw_df.copy()
-    df["timestamp_utc"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-    df["measured_energy_kwh"] = pd.to_numeric(df[prod_col], errors="coerce")
-    df = df.dropna(subset=["timestamp_utc"]).copy()
-    df = add_common_time_columns(df)
-    df = df[["timestamp_utc", "month", "day", "hour", "mdh_key", "measured_energy_kwh"]].dropna(subset=["measured_energy_kwh"])
-
-    if df.empty:
-        raise ValueError("La colonna selezionata per la produzione misurata non contiene valori numerici validi.")
-
-    median_val = float(pd.to_numeric(df["measured_energy_kwh"], errors="coerce").median())
-    max_val = float(pd.to_numeric(df["measured_energy_kwh"], errors="coerce").max())
-    plausible_hourly_limit = max(10.0, float(peakpower_kwp) * 3.0)
-
-    if median_val > plausible_hourly_limit or max_val > plausible_hourly_limit * 10:
-        raise ValueError(
-            "La colonna selezionata come produzione misurata non sembra essere espressa in kWh orari. "
-            "Probabilmente hai scelto una colonna timestamp o un identificativo numerico."
-        )
-
-    return df
-
-
 def compare_expected_vs_measured(expected_df: pd.DataFrame, monitoring_df: Optional[pd.DataFrame], baseline_df: pd.DataFrame) -> pd.DataFrame:
     baseline_cols = ["mdh_key"]
     for c in ["baseline_energy_kwh", "baseline_power_w", "G(i)", "Gb(i)", "Gd(i)", "Gr(i)", "H_sun", "T2m", "WS10m"]:
@@ -602,16 +846,25 @@ def compare_expected_vs_measured(expected_df: pd.DataFrame, monitoring_df: Optio
     out = expected_df.merge(baseline_small, on="mdh_key", how="left")
 
     if monitoring_df is not None and not monitoring_df.empty:
-        out = out.merge(monitoring_df, on="timestamp_utc", how="left")
+        merge_cols = ["timestamp_utc", "measured_energy_kwh"]
+        if "measured_power_kw" in monitoring_df.columns:
+            merge_cols.append("measured_power_kw")
+        out = out.merge(monitoring_df[merge_cols], on="timestamp_utc", how="left")
+
         out["deviation_kwh"] = out["measured_energy_kwh"] - out["expected_energy_kwh"]
         denom = out["expected_energy_kwh"].replace(0, pd.NA)
         out["deviation_pct"] = (out["deviation_kwh"] / denom) * 100.0
         out["performance_ratio_proxy"] = out["measured_energy_kwh"] / denom
     else:
         out["measured_energy_kwh"] = pd.NA
+        out["measured_power_kw"] = pd.NA
         out["deviation_kwh"] = pd.NA
         out["deviation_pct"] = pd.NA
         out["performance_ratio_proxy"] = pd.NA
+
+    out["delta_expected_vs_baseline_kwh"] = out["expected_energy_kwh"] - out.get("baseline_energy_kwh", pd.Series(index=out.index, dtype=float))
+    denom_baseline = pd.to_numeric(out.get("baseline_energy_kwh", pd.Series(index=out.index, dtype=float)), errors="coerce").replace(0, pd.NA)
+    out["delta_expected_vs_baseline_pct"] = (out["delta_expected_vs_baseline_kwh"] / denom_baseline) * 100.0
 
     return out
 
@@ -622,10 +875,12 @@ def summarize_kpis(comparison_df: pd.DataFrame, source_name: str, percentile: in
         "baseline_percentile": percentile,
         "rows_comparison": int(len(comparison_df)),
         "expected_energy_total_kwh": pd.to_numeric(comparison_df["expected_energy_kwh"], errors="coerce").sum(),
+        "baseline_energy_total_kwh": pd.to_numeric(comparison_df.get("baseline_energy_kwh"), errors="coerce").sum(),
         "measured_energy_total_kwh": pd.to_numeric(comparison_df["measured_energy_kwh"], errors="coerce").sum(),
         "mean_deviation_pct": pd.to_numeric(comparison_df["deviation_pct"], errors="coerce").mean(),
         "median_deviation_pct": pd.to_numeric(comparison_df["deviation_pct"], errors="coerce").median(),
         "mean_performance_ratio_proxy": pd.to_numeric(comparison_df["performance_ratio_proxy"], errors="coerce").mean(),
+        "mean_delta_expected_vs_baseline_pct": pd.to_numeric(comparison_df["delta_expected_vs_baseline_pct"], errors="coerce").mean(),
         "hours_with_measurements": int(pd.to_numeric(comparison_df["measured_energy_kwh"], errors="coerce").notna().sum()),
         "hours_large_negative_deviation_lt_minus_15pct": int((pd.to_numeric(comparison_df["deviation_pct"], errors="coerce") < -15).sum()),
     }
@@ -640,18 +895,24 @@ def to_excel_bytes(
     expected_recent: pd.DataFrame,
     comparison_df: pd.DataFrame,
     monitoring_raw: Optional[pd.DataFrame],
+    monitoring_prepared: Optional[pd.DataFrame],
+    config_raw_sheet: Optional[pd.DataFrame],
     kpi_df: pd.DataFrame,
 ) -> bytes:
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         pd.DataFrame(config_rows).to_excel(writer, sheet_name="INPUT_CONFIG", index=False)
+        if config_raw_sheet is not None:
+            config_raw_sheet.to_excel(writer, sheet_name="PLANT_CONFIG_RAW", index=False)
         remove_timezone_for_excel(baseline_raw).to_excel(writer, sheet_name="PVGIS_BASELINE_RAW", index=False)
         remove_timezone_for_excel(baseline_percentile).to_excel(writer, sheet_name="PVGIS_BASELINE_PCTL", index=False)
         remove_timezone_for_excel(recent_weather_raw).to_excel(writer, sheet_name="RECENT_WEATHER_RAW", index=False)
         remove_timezone_for_excel(expected_recent).to_excel(writer, sheet_name="EXPECTED_RECENT", index=False)
         remove_timezone_for_excel(comparison_df).to_excel(writer, sheet_name="COMPARISON", index=False)
         if monitoring_raw is not None:
-            remove_timezone_for_excel(monitoring_raw).to_excel(writer, sheet_name="MONITORING_RAW", index=False)
+            monitoring_raw.to_excel(writer, sheet_name="MONITORING_RAW", index=False)
+        if monitoring_prepared is not None:
+            remove_timezone_for_excel(monitoring_prepared).to_excel(writer, sheet_name="MONITORING_PREPARED", index=False)
         kpi_df.to_excel(writer, sheet_name="KPI_SUMMARY", index=False)
 
         workbook = writer.book
@@ -781,7 +1042,7 @@ def render_runs_ui(current_user: Dict) -> None:
         st.warning("File del run non trovato sul server.")
 
 
-def validation_checks(plant_cfg: Dict, baseline_cfg: Dict, recent_cfg: Dict, source_name: str, monitoring_present: bool) -> None:
+def validation_checks(plant_cfg: Dict, baseline_cfg: Dict, recent_cfg: Dict, source_name: str) -> None:
     min_year, max_year = get_db_year_limits(plant_cfg["raddatabase"])
     if baseline_cfg["startyear"] < min_year or baseline_cfg["endyear"] > max_year:
         raise ValueError(f"Con {plant_cfg['raddatabase']} gli anni disponibili sono {min_year}-{max_year}.")
@@ -799,22 +1060,20 @@ def validation_checks(plant_cfg: Dict, baseline_cfg: Dict, recent_cfg: Dict, sou
         selected = recent_cfg.get("open_meteo_hourly_variables", [])
         for required_var in OPEN_METEO_MIN_REQUIRED:
             if required_var not in selected:
-                raise ValueError(f"Per Open-Meteo seleziona almeno i parametri obbligatori: {', '.join(OPEN_METEO_MIN_REQUIRED)}.")
-    if source_name == "PVGIS recente":
-        raise ValueError("PVGIS non è adatto ai dati recenti oltre il 2023 in questa app. Usa Open-Meteo o NASA POWER.")
-    if not monitoring_present:
-        st.warning("Nessun file di monitoraggio caricato: l'output conterrà baseline e produzione attesa recente, ma non il confronto col misurato.")
+                raise ValueError(
+                    f"Per Open-Meteo seleziona almeno i parametri obbligatori: {', '.join(OPEN_METEO_MIN_REQUIRED)}."
+                )
 
 
 def render_structure() -> None:
     st.markdown(
         """
 ### Struttura funzionale
-**1. Baseline storica PVGIS** → profilo storico multi-anno e percentile P50/P10  
-**2. Meteo reale recente** → Open-Meteo o NASA POWER per il periodo da verificare  
-**3. Monitoraggio impianto** → file CSV/Excel con timestamp e produzione misurata  
+**1. File impianto** → foglio configurazione obbligatorio + foglio misure opzionale  
+**2. Baseline storica PVGIS** → profilo storico multi-anno e percentile P50/P10  
+**3. Meteo reale recente** → Open-Meteo o NASA POWER per il periodo da verificare  
 **4. Produzione attesa corretta** → stima oraria da irraggiamento recente + temperatura + perdite  
-**5. Verifica** → confronto tra atteso, misurato e baseline storica
+**5. Verifica** → confronto tra atteso, baseline storica e, se disponibile, misurato
         """
     )
 
@@ -844,39 +1103,109 @@ def app_ui() -> None:
     today_minus_7 = date.today() - timedelta(days=7)
     default_recent_start = today_minus_7 - timedelta(days=2)
 
+    st.markdown("### A. File impianto")
+    uploaded_plant_file = st.file_uploader(
+        "Carica file impianto Excel (.xlsx/.xls) con foglio configurazione e foglio misure opzionale",
+        type=["xlsx", "xls"],
+        key="plant_workbook_uploader",
+    )
+
+    parsed_workbook = None
+    prefill = {}
+    measurements_from_file = None
+    config_raw_sheet = None
+    measurements_raw_sheet = None
+
+    if uploaded_plant_file is not None:
+        try:
+            parsed_workbook = load_plant_workbook(uploaded_plant_file)
+            prefill = parsed_workbook["plant_cfg"]
+            measurements_from_file = parsed_workbook["measurements_df"]
+            config_raw_sheet = parsed_workbook["config_raw_df"]
+            measurements_raw_sheet = parsed_workbook["measurements_raw_df"]
+
+            st.success(
+                f"File caricato correttamente. Foglio configurazione: {parsed_workbook['config_sheet_name']}. "
+                + (
+                    f"Foglio misure: {parsed_workbook['measure_sheet_name']}."
+                    if parsed_workbook["measure_sheet_name"] is not None
+                    else "Foglio misure non presente: verrà eseguito solo il confronto atteso vs baseline."
+                )
+            )
+
+            if measurements_from_file is not None:
+                st.caption(
+                    f"Misure trovate: {len(measurements_from_file)} righe orarie dopo il riempimento dei buchi con zero."
+                )
+        except Exception as exc:
+            st.error(f"Errore nel file impianto: {exc}")
+            return
+    else:
+        st.warning("Il file impianto con foglio configurazione è obbligatorio.")
+        return
+
+    default_token = None
+    if uploaded_plant_file is not None:
+        default_token = f"{uploaded_plant_file.name}_{uploaded_plant_file.size}"
+
     with st.form("verification_form"):
-        st.markdown("### A. Configurazione impianto")
+        st.markdown("### B. Configurazione impianto")
         a1, a2, a3 = st.columns(3)
         with a1:
-            codice_impianto = st.text_input("Codice impianto", value="SRB_xxx")
-            lat = st.number_input("Latitudine", value=41.8927524, format="%.7f")
-            lon = st.number_input("Longitudine", value=12.4853054, format="%.7f")
-            peakpower = st.number_input("Peak power [kWp]", min_value=0.0, value=1.0, step=0.1)
-            loss = st.number_input("Loss [%]", min_value=0.0, max_value=100.0, value=14.0, step=0.5)
+            codice_impianto = st.text_input("Codice impianto", value=str(prefill.get("codice_impianto", "SRB_xxx")))
+            lat = st.number_input("Latitudine", value=float(prefill.get("lat", 41.8927524)), format="%.7f")
+            lon = st.number_input("Longitudine", value=float(prefill.get("lon", 12.4853054)), format="%.7f")
+            peakpower = st.number_input("Peak power [kWp]", min_value=0.0, value=float(prefill.get("peakpower", 1.0)), step=0.1)
+            loss = st.number_input("Loss [%]", min_value=0.0, max_value=100.0, value=float(prefill.get("loss", 14.0)), step=0.5)
         with a2:
-            pvtechchoice = st.selectbox("Tecnologia pannello", ["crystSi", "CIS", "CdTe", "Unknown"], index=0)
-            mountingplace = st.selectbox("Tipo di montaggio", ["free", "building"], index=0)
-            optimalangles = st.checkbox("Optimal angles", value=False)
-            angle = st.number_input("Tilt [°]", min_value=0.0, max_value=90.0, value=30.0, step=1.0)
-            aspect = st.number_input("Azimut [°]", min_value=-180.0, max_value=180.0, value=0.0, step=1.0)
-        with a3:
-            tracking_mode = st.selectbox(
-                "Tracking",
-                ["fixed", "trackingtype_horizontal", "trackingtype_tilted", "trackingtype_biaxial"],
-                index=0,
-            )
-            raddatabase = st.selectbox("Radiation database PVGIS", ["PVGIS-SARAH3", "PVGIS-ERA5", "PVGIS-SARAH2"], index=0)
-            min_year, max_year = get_db_year_limits(raddatabase)
-            startyear = st.number_input("Anno iniziale baseline", min_value=min_year, max_value=max_year, value=min_year, step=1)
-            endyear = st.number_input("Anno finale baseline", min_value=min_year, max_value=max_year, value=max_year, step=1)
-            usehorizon = st.checkbox("Use horizon", value=True)
-            components = st.checkbox("Radiation components", value=True)
+            pvtech_options = ["crystSi", "CIS", "CdTe", "Unknown"]
+            pvtech_default = prefill.get("pvtechchoice", "crystSi")
+            pvtech_idx = pvtech_options.index(pvtech_default) if pvtech_default in pvtech_options else 0
+            pvtechchoice = st.selectbox("Tecnologia pannello", pvtech_options, index=pvtech_idx)
 
-        st.markdown("### B. Baseline storica")
+            mounting_options = ["free", "building"]
+            mounting_default = prefill.get("mountingplace", "free")
+            mounting_idx = mounting_options.index(mounting_default) if mounting_default in mounting_options else 0
+            mountingplace = st.selectbox("Tipo di montaggio", mounting_options, index=mounting_idx)
+
+            optimalangles = st.checkbox("Optimal angles", value=bool(prefill.get("optimalangles", False)))
+            angle = st.number_input("Tilt [°]", min_value=0.0, max_value=90.0, value=float(prefill.get("angle", 30.0)), step=1.0)
+            aspect = st.number_input("Azimut [°]", min_value=-180.0, max_value=180.0, value=float(prefill.get("aspect", 0.0)), step=1.0)
+        with a3:
+            tracking_options = ["fixed", "trackingtype_horizontal", "trackingtype_tilted", "trackingtype_biaxial"]
+            tracking_default = prefill.get("tracking_mode", "fixed")
+            tracking_idx = tracking_options.index(tracking_default) if tracking_default in tracking_options else 0
+            tracking_mode = st.selectbox("Tracking", tracking_options, index=tracking_idx)
+
+            raddb_options = ["PVGIS-SARAH3", "PVGIS-ERA5", "PVGIS-SARAH2"]
+            raddb_default = prefill.get("raddatabase", "PVGIS-SARAH3")
+            raddb_idx = raddb_options.index(raddb_default) if raddb_default in raddb_options else 0
+            raddatabase = st.selectbox("Radiation database PVGIS", raddb_options, index=raddb_idx)
+
+            min_year, max_year = get_db_year_limits(raddatabase)
+            startyear = st.number_input(
+                "Anno iniziale baseline",
+                min_value=min_year,
+                max_value=max_year,
+                value=min(max(int(prefill.get("startyear", min_year)), min_year), max_year),
+                step=1,
+            )
+            endyear = st.number_input(
+                "Anno finale baseline",
+                min_value=min_year,
+                max_value=max_year,
+                value=min(max(int(prefill.get("endyear", max_year)), min_year), max_year),
+                step=1,
+            )
+            usehorizon = st.checkbox("Use horizon", value=bool(prefill.get("usehorizon", True)))
+            components = st.checkbox("Radiation components", value=bool(prefill.get("components", True)))
+
+        st.markdown("### C. Baseline storica")
         percentile = st.selectbox("Percentile baseline", [10, 50], index=1)
 
-        st.markdown("### C. Meteo reale recente")
+        st.markdown("### D. Meteo reale recente")
         source_name = st.selectbox("Fonte meteo recente", ["Open-Meteo", "NASA POWER"], index=0, key="weather_source")
+
         r1, r2 = st.columns(2)
         with r1:
             recent_start_date = st.date_input("Data iniziale meteo recente", value=default_recent_start)
@@ -885,7 +1214,7 @@ def app_ui() -> None:
 
         if source_name == "Open-Meteo":
             open_meteo_hourly_variables = st.multiselect(
-                "Misure orarie da scaricare (Open-Meteo)",
+                "Misure orarie da scaricare",
                 options=list(OPEN_METEO_VARIABLE_LABELS.keys()),
                 default=OPEN_METEO_RECOMMENDED_DEFAULT,
                 format_func=lambda x: f"{x} — {OPEN_METEO_VARIABLE_LABELS.get(x, x)}",
@@ -895,7 +1224,7 @@ def app_ui() -> None:
             nasa_parameters = []
         else:
             nasa_parameters = st.multiselect(
-                "Misure orarie da scaricare (NASA POWER)",
+                "Misure orarie da scaricare",
                 options=list(NASA_PARAMETER_LABELS.keys()),
                 default=["ALLSKY_SFC_SW_DWN", "T2M", "WS10M", "ALLSKY_SFC_SW_DNI", "ALLSKY_SFC_SW_DIFF"],
                 format_func=lambda x: f"{x} — {NASA_PARAMETER_LABELS.get(x, x)}",
@@ -904,12 +1233,14 @@ def app_ui() -> None:
             )
             open_meteo_hourly_variables = []
 
-        st.markdown("### D. Dati di monitoraggio")
-        monitoring_file = st.file_uploader("Carica CSV o Excel del monitoraggio", type=["csv", "xlsx", "xls"])
-
         submit = st.form_submit_button("Esegui verifica e genera output")
 
-    if not submit:
+    auto_submit = False
+    if default_token is not None and st.session_state.get("last_autorun_upload_token") != default_token:
+        auto_submit = True
+        st.session_state["last_autorun_upload_token"] = default_token
+
+    if not submit and not auto_submit:
         return
 
     try:
@@ -937,7 +1268,7 @@ def app_ui() -> None:
             "open_meteo_hourly_variables": open_meteo_hourly_variables,
         }
 
-        validation_checks(plant_cfg, baseline_cfg, recent_cfg, source_name, monitoring_file is not None)
+        validation_checks(plant_cfg, baseline_cfg, recent_cfg, source_name)
 
         progress = st.progress(0, text="Validazione input completata")
         status = st.empty()
@@ -946,7 +1277,9 @@ def app_ui() -> None:
         pvgis_cfg.update({"startyear": baseline_cfg["startyear"], "endyear": baseline_cfg["endyear"]})
 
         if source_name == "Open-Meteo":
-            meteo_request_params = build_open_meteo_params(recent_cfg, plant_cfg["lat"], plant_cfg["lon"], plant_cfg["angle"], plant_cfg["aspect"])
+            meteo_request_params = build_open_meteo_params(
+                recent_cfg, plant_cfg["lat"], plant_cfg["lon"], plant_cfg["angle"], plant_cfg["aspect"]
+            )
             meteo_request_line = render_request_line(OPEN_METEO_ARCHIVE_URL, meteo_request_params)
         else:
             nasa_cfg = {
@@ -958,18 +1291,32 @@ def app_ui() -> None:
             meteo_request_line = render_request_line(NASA_BASE_URL, meteo_request_params)
 
         st.subheader("Traccia chiamate API")
-        st.code(render_request_line(PVGIS_BASE_URL, build_pvgis_params(pvgis_cfg)), language=None)
-        st.code(meteo_request_line, language=None)
+        trace_text = (
+            "Chiamata PVGIS\n"
+            f"{render_request_line(PVGIS_BASE_URL, build_pvgis_params(pvgis_cfg))}\n\n"
+            f"Fonte recente: {source_name}\n"
+            f"{meteo_request_line}"
+        )
+        st.code(trace_text, language=None)
 
         status.info("1/5 - Scarico baseline PVGIS")
-        pvgis_cfg.update({"startyear": baseline_cfg["startyear"], "endyear": baseline_cfg["endyear"]})
         baseline_raw = fetch_pvgis_hourly(pvgis_cfg)
-        baseline_percentile = aggregate_pvgis_baseline(baseline_raw, percentile=baseline_cfg["percentile"], plant_code=plant_cfg["codice_impianto"])
+        baseline_percentile = aggregate_pvgis_baseline(
+            baseline_raw,
+            percentile=baseline_cfg["percentile"],
+            plant_code=plant_cfg["codice_impianto"],
+        )
         progress.progress(20, text="Baseline PVGIS pronta")
 
         status.info(f"2/5 - Scarico meteo recente da {source_name}")
         if source_name == "Open-Meteo":
-            recent_weather_raw = fetch_open_meteo_hourly(recent_cfg, plant_cfg["lat"], plant_cfg["lon"], plant_cfg["angle"], plant_cfg["aspect"])
+            recent_weather_raw = fetch_open_meteo_hourly(
+                recent_cfg,
+                plant_cfg["lat"],
+                plant_cfg["lon"],
+                plant_cfg["angle"],
+                plant_cfg["aspect"],
+            )
         else:
             recent_weather_raw = fetch_nasa_hourly(nasa_cfg, plant_cfg["lat"], plant_cfg["lon"])
         progress.progress(45, text="Meteo recente scaricato")
@@ -978,31 +1325,12 @@ def app_ui() -> None:
         expected_recent = compute_expected_from_recent_weather(recent_weather_raw, plant_cfg, source_name)
         progress.progress(65, text="Produzione attesa calcolata")
 
-        monitoring_raw = None
-        monitoring_prepared = None
-        if monitoring_file is not None:
-            status.info("4/5 - Carico il file di monitoraggio e chiedo il mapping colonne")
-            monitoring_raw = load_monitoring_file(monitoring_file)
-            st.subheader("Mapping colonne monitoraggio")
-            candidate_ts_cols = monitoring_raw.columns.tolist()
-            candidate_prod_cols = [
-                c for c in monitoring_raw.columns
-                if pd.api.types.is_numeric_dtype(monitoring_raw[c])
-                or any(token in c.lower() for token in ["energy", "energia", "kwh", "power", "potenza", "prod"])
-            ]
-            if not candidate_prod_cols:
-                candidate_prod_cols = monitoring_raw.columns.tolist()
-
-            default_ts_idx = candidate_ts_cols.index("timestamp_utc") if "timestamp_utc" in candidate_ts_cols else 0
-            default_prod_idx = candidate_prod_cols.index("measured_energy_kwh") if "measured_energy_kwh" in candidate_prod_cols else 0
-
-            m1, m2 = st.columns(2)
-            with m1:
-                ts_col = st.selectbox("Colonna timestamp", candidate_ts_cols, index=default_ts_idx, key="ts_col")
-            with m2:
-                prod_col = st.selectbox("Colonna energia/prodotto [kWh]", candidate_prod_cols, index=default_prod_idx, key="prod_col")
-            monitoring_prepared = prepare_monitoring_df(monitoring_raw, ts_col, prod_col, peakpower_kwp=plant_cfg["peakpower"])
-        progress.progress(82, text="Monitoraggio preparato")
+        status.info("4/5 - Preparo misure da file impianto")
+        monitoring_prepared = measurements_from_file
+        monitoring_raw = measurements_raw_sheet
+        if monitoring_prepared is None:
+            st.info("Foglio misure assente: verrà prodotto solo il confronto tra atteso e baseline.")
+        progress.progress(82, text="Misure preparate")
 
         status.info("5/5 - Costruisco confronto, KPI ed Excel")
         comparison_df = compare_expected_vs_measured(expected_recent, monitoring_prepared, baseline_percentile)
@@ -1013,11 +1341,18 @@ def app_ui() -> None:
         ] + [
             {"section": "baseline", "key": k, "value": v} for k, v in baseline_cfg.items()
         ] + [
-            {"section": "recent_weather", "key": k, "value": v.isoformat() if hasattr(v, "isoformat") else v} for k, v in recent_cfg.items()
+            {"section": "recent_weather", "key": k, "value": v.isoformat() if hasattr(v, "isoformat") else v}
+            for k, v in recent_cfg.items()
         ] + [
             {"section": "run", "key": "generated_at_utc", "value": datetime.utcnow().isoformat()},
             {"section": "run", "key": "user", "value": user["username"]},
             {"section": "run", "key": "weather_source", "value": source_name},
+            {"section": "run", "key": "measurements_present", "value": monitoring_prepared is not None},
+            {
+                "section": "run",
+                "key": "measurements_holes_filled_with_zero",
+                "value": True if monitoring_prepared is not None else None,
+            },
         ]
 
         output_name = build_run_filename(codice_impianto, source_name, int(percentile))
@@ -1029,6 +1364,8 @@ def app_ui() -> None:
             expected_recent=expected_recent,
             comparison_df=comparison_df,
             monitoring_raw=monitoring_raw,
+            monitoring_prepared=monitoring_prepared,
+            config_raw_sheet=config_raw_sheet,
             kpi_df=kpi_df,
         )
 
@@ -1041,16 +1378,26 @@ def app_ui() -> None:
         st.subheader("Prime righe del confronto")
         view_cols = [
             c for c in [
-                "timestamp_utc", "expected_energy_kwh", "measured_energy_kwh", "deviation_pct",
-                "performance_ratio_proxy", "irradiance_proxy_wm2", "temp_air_c", "expected_method",
-                "baseline_energy_kwh", "baseline_power_w", "baseline_Gi_wm2"
+                "timestamp_utc",
+                "expected_energy_kwh",
+                "baseline_energy_kwh",
+                "delta_expected_vs_baseline_pct",
+                "measured_power_kw",
+                "measured_energy_kwh",
+                "deviation_pct",
+                "performance_ratio_proxy",
+                "irradiance_proxy_wm2",
+                "temp_air_c",
+                "expected_method",
+                "baseline_power_w",
+                "baseline_Gi_wm2",
             ] if c in comparison_df.columns
         ]
         st.dataframe(comparison_df[view_cols].head(100), use_container_width=True)
 
         st.subheader("Grafico orario di confronto")
         chart_df = comparison_df.copy().sort_values("timestamp_utc")
-        chart_cols = [c for c in ["expected_energy_kwh", "measured_energy_kwh", "baseline_energy_kwh"] if c in chart_df.columns]
+        chart_cols = [c for c in ["expected_energy_kwh", "baseline_energy_kwh", "measured_energy_kwh"] if c in chart_df.columns]
         if chart_cols:
             line_df = chart_df[["timestamp_utc"] + chart_cols].set_index("timestamp_utc")
             st.line_chart(line_df, height=360)
@@ -1079,7 +1426,8 @@ def app_ui() -> None:
             st.write(
                 "Open-Meteo usa GTI oraria se disponibile; NASA POWER usa GHI come proxy semplice dell'irraggiamento sul piano. "
                 "La baseline PVGIS viene convertita da P [W] a baseline_energy_kwh su base oraria dividendo per 1000. "
-                "La produzione attesa recente viene calcolata moltiplicando esplicitamente per la peak power dell'impianto [kWp]."
+                "Le misure del file impianto sono lette come Potenza misurata [kW] oraria: i buchi dell'intervallo vengono riempiti con zero. "
+                "Per il confronto orario, kW medi orari e kWh dell'ora vengono assunti numericamente equivalenti."
             )
     except requests.HTTPError as exc:
         body = exc.response.text[:1200] if exc.response is not None else str(exc)
