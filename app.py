@@ -1191,6 +1191,7 @@ def app_ui() -> None:
 
     today_minus_7 = date.today() - timedelta(days=7)
     default_recent_start = today_minus_7 - timedelta(days=2)
+    default_recent_end = today_minus_7
 
     st.markdown("### A. File impianto")
     uploaded_plant_file = st.file_uploader(
@@ -1301,9 +1302,17 @@ def app_ui() -> None:
 
         r1, r2 = st.columns(2)
         with r1:
-            recent_start_date = st.date_input("Data iniziale meteo recente", value=default_recent_start)
+            recent_start_date = st.date_input(
+                "Data iniziale meteo recente",
+                value=default_recent_start,
+                help="Se il file misure è presente, viene proposta automaticamente la data minima delle misure.",
+            )
         with r2:
-            recent_end_date = st.date_input("Data finale meteo recente", value=today_minus_7)
+            recent_end_date = st.date_input(
+                "Data finale meteo recente",
+                value=default_recent_end,
+                help="Se il file misure è presente, viene proposta automaticamente la data massima delle misure.",
+            )
 
         if source_name == "Open-Meteo":
             open_meteo_hourly_variables = st.multiselect(
@@ -1547,3 +1556,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
