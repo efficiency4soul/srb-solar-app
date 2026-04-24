@@ -22,6 +22,7 @@ DEFAULT_OUTPUT_NAME = "srb_solar_verification_output.xlsx"
 PVGIS_BASE_URL = "https://re.jrc.ec.europa.eu/api/v5_3/seriescalc"
 NASA_BASE_URL = "https://power.larc.nasa.gov/api/temporal/hourly/point"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+LOCAL_TIMEZONE = "Europe/Rome"
 
 PVGIS_DB_YEAR_LIMITS = {
     "PVGIS-SARAH2": (2005, 2020),
@@ -414,17 +415,7 @@ MEASURE_ALIASES = {
     "month": ["mese", "month"],
     "day": ["giorno", "day"],
     "hour": ["ora", "hour"],
-    "power_kw": [
-        "potenza_misurata_kw",
-        "potenza misurata kw",
-        "potenza_misurata_kwh",
-        "potenza misurata kwh",
-        "potenza_kw",
-        "power_kw",
-        "power",
-        "kw",
-        "potenza",
-    ],
+    "power_kw": ["potenza_misurata_kw", "potenza misurata kw", "potenza_kw", "power_kw", "power", "kw", "potenza"],
 }
 
 
@@ -435,21 +426,17 @@ def find_header_row(
     min_found: int = 4,
     max_rows: int = 50,
 ) -> Optional[int]:
-    """Trova la riga di intestazione anche se prima ci sono titolo, note o righe vuote."""
+    """Trova la riga di intestazione anche se il foglio ha titolo/istruzioni sopra la tabella."""
     preview = pd.read_excel(xls, sheet_name=sheet_name, header=None, nrows=max_rows)
     alias_groups = list(aliases_dict.values())
 
     for row_idx in range(len(preview)):
         row_values = [normalize_text(v) for v in preview.iloc[row_idx].tolist() if not pd.isna(v)]
-        if not row_values:
-            continue
-
         found = 0
         for aliases in alias_groups:
             aliases_norm = [normalize_text(a) for a in aliases]
             if any(alias in row_values for alias in aliases_norm):
                 found += 1
-
         if found >= min_found:
             return row_idx
 
@@ -462,7 +449,6 @@ def read_excel_with_detected_header(
     aliases_dict: Dict[str, List[str]],
     min_found: int = 4,
 ) -> pd.DataFrame:
-    """Legge un foglio Excel usando la riga header individuata automaticamente."""
     header_row = find_header_row(
         xls=xls,
         sheet_name=sheet_name,
@@ -502,7 +488,6 @@ def detect_sheet_roles(xls: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]
                 config_sheet = sheet
 
     if config_sheet is None:
-        # fallback: il primo foglio che non sia misure
         for sheet in xls.sheet_names:
             if sheet != measure_sheet:
                 config_sheet = sheet
@@ -514,7 +499,6 @@ def detect_sheet_roles(xls: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]
 def dataframe_to_key_value(df: pd.DataFrame) -> Dict[str, object]:
     out = {}
 
-    # caso 1: prime due colonne key/value
     if df.shape[1] >= 2:
         c0 = df.columns[0]
         c1 = df.columns[1]
@@ -523,7 +507,6 @@ def dataframe_to_key_value(df: pd.DataFrame) -> Dict[str, object]:
             if key:
                 out[key] = row[c1]
 
-    # caso 2: una riga con intestazioni = chiavi
     if df.shape[0] >= 1:
         first_row = df.iloc[0].to_dict()
         for k, v in first_row.items():
@@ -549,7 +532,6 @@ def parse_plant_config_sheet(df: pd.DataFrame) -> Dict:
     for target_key, aliases in CONFIG_ALIASES.items():
         cfg[target_key] = pick_value_from_aliases(raw_kv, aliases)
 
-    # default robusti
     cfg["codice_impianto"] = cfg["codice_impianto"] or "SRB_xxx"
     cfg["lat"] = safe_float(cfg["lat"], None)
     cfg["lon"] = safe_float(cfg["lon"], None)
@@ -590,7 +572,7 @@ def rename_measurement_columns(df: pd.DataFrame) -> pd.DataFrame:
     return renamed
 
 
-def prepare_measurements_from_sheet(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, object]]:
+def prepare_measurements_from_sheet(raw_df: pd.DataFrame, local_timezone: str = LOCAL_TIMEZONE) -> pd.DataFrame:
     df = rename_measurement_columns(raw_df)
 
     required = ["year", "month", "day", "hour", "power_kw"]
@@ -598,23 +580,20 @@ def prepare_measurements_from_sheet(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame,
     if missing:
         raise ValueError(
             "Il foglio misure deve contenere le colonne anno, mese, giorno, ora e Potenza misurata in kW. "
-            f"Mancano: {', '.join(missing)}. Colonne trovate: {', '.join(map(str, raw_df.columns))}"
+            f"Mancano: {', '.join(missing)}"
         )
 
     df = df.copy()
-    initial_rows = len(df)
     for c in required:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    invalid_datetime_rows = int(df[["year", "month", "day", "hour"]].isna().any(axis=1).sum())
     df = df.dropna(subset=["year", "month", "day", "hour"]).copy()
     if df.empty:
         raise ValueError("Il foglio misure è presente ma non contiene righe valide.")
 
-    power_null_or_invalid_rows = int(df["power_kw"].isna().sum())
     df["power_kw"] = pd.to_numeric(df["power_kw"], errors="coerce").fillna(0.0)
 
-    df["timestamp_utc"] = pd.to_datetime(
+    df["timestamp_local"] = pd.to_datetime(
         dict(
             year=df["year"].astype(int),
             month=df["month"].astype(int),
@@ -622,57 +601,89 @@ def prepare_measurements_from_sheet(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame,
             hour=df["hour"].astype(int),
         ),
         errors="coerce",
-        utc=True,
     )
 
-    invalid_timestamp_rows = int(df["timestamp_utc"].isna().sum())
-    df = df.dropna(subset=["timestamp_utc"]).copy()
+    df = df.dropna(subset=["timestamp_local"]).copy()
     if df.empty:
         raise ValueError("Impossibile costruire timestamp validi dal foglio misure.")
 
-    duplicate_hour_rows = int(df.duplicated(subset=["timestamp_utc"]).sum())
-    df["measured_power_kw"] = df["power_kw"]
-    df = df.groupby("timestamp_utc", as_index=False)["measured_power_kw"].mean()
+    try:
+        df["timestamp_local"] = df["timestamp_local"].dt.tz_localize(
+            local_timezone,
+            ambiguous="infer",
+            nonexistent="shift_forward",
+        )
+    except Exception:
+        df["timestamp_local"] = df["timestamp_local"].dt.tz_localize(
+            local_timezone,
+            ambiguous="NaT",
+            nonexistent="shift_forward",
+        )
+        df = df.dropna(subset=["timestamp_local"]).copy()
 
-    full_index = pd.date_range(
+    df["timestamp_utc"] = df["timestamp_local"].dt.tz_convert("UTC")
+    df["measured_power_kw"] = df["power_kw"]
+
+    df = (
+        df.groupby(["timestamp_utc", "timestamp_local"], as_index=False)["measured_power_kw"]
+        .mean()
+        .sort_values("timestamp_utc")
+    )
+
+    full_index_utc = pd.date_range(
         start=df["timestamp_utc"].min(),
         end=df["timestamp_utc"].max(),
         freq="h",
         tz="UTC",
     )
 
-    rows_before_fill = len(df)
     df = (
         df.set_index("timestamp_utc")
-        .reindex(full_index)
+        .reindex(full_index_utc)
         .rename_axis("timestamp_utc")
         .reset_index()
     )
-    inserted_missing_hours = int(len(df) - rows_before_fill)
-    df["measured_power_kw"] = pd.to_numeric(df["measured_power_kw"], errors="coerce").fillna(0.0)
 
-    # per serie orarie, kW medi dell'ora ~= kWh nell'ora
+    df["timestamp_local"] = df["timestamp_utc"].dt.tz_convert(local_timezone)
+    df["measured_power_kw"] = pd.to_numeric(df["measured_power_kw"], errors="coerce").fillna(0.0)
     df["measured_energy_kwh"] = df["measured_power_kw"]
 
-    df["year"] = df["timestamp_utc"].dt.year
-    df["month"] = df["timestamp_utc"].dt.month
-    df["day"] = df["timestamp_utc"].dt.day
-    df["hour"] = df["timestamp_utc"].dt.hour
-    df["mdh_key"] = df["timestamp_utc"].dt.strftime("%m-%d %H:00")
+    df["year"] = df["timestamp_local"].dt.year
+    df["month"] = df["timestamp_local"].dt.month
+    df["day"] = df["timestamp_local"].dt.day
+    df["hour"] = df["timestamp_local"].dt.hour
+    df["local_date"] = df["timestamp_local"].dt.date
+    df["mdh_key"] = df["timestamp_local"].dt.strftime("%m-%d %H:00")
 
-    diagnostics = {
-        "measurement_input_rows": int(initial_rows),
-        "measurement_valid_unique_hours": int(rows_before_fill),
-        "measurement_final_hourly_rows": int(len(df)),
-        "measurement_inserted_missing_hours_zero": inserted_missing_hours,
-        "measurement_invalid_datetime_rows_discarded": invalid_datetime_rows + invalid_timestamp_rows,
-        "measurement_invalid_power_rows_set_to_zero": power_null_or_invalid_rows,
-        "measurement_duplicate_hour_rows_averaged": duplicate_hour_rows,
-        "measurement_start_utc": df["timestamp_utc"].min().isoformat() if not df.empty else None,
-        "measurement_end_utc": df["timestamp_utc"].max().isoformat() if not df.empty else None,
-    }
+    return df[
+        [
+            "timestamp_utc",
+            "timestamp_local",
+            "year",
+            "month",
+            "day",
+            "hour",
+            "local_date",
+            "mdh_key",
+            "measured_power_kw",
+            "measured_energy_kwh",
+        ]
+    ]
 
-    return df[["timestamp_utc", "year", "month", "day", "hour", "mdh_key", "measured_power_kw", "measured_energy_kwh"]], diagnostics
+
+def get_measurement_local_date_range(measurements_df: Optional[pd.DataFrame]) -> Tuple[Optional[date], Optional[date]]:
+    if measurements_df is None or measurements_df.empty:
+        return None, None
+
+    if "timestamp_local" in measurements_df.columns:
+        local_ts = measurements_df["timestamp_local"]
+        return local_ts.min().date(), local_ts.max().date()
+
+    if "timestamp_utc" in measurements_df.columns:
+        local_ts = measurements_df["timestamp_utc"].dt.tz_convert(LOCAL_TIMEZONE)
+        return local_ts.min().date(), local_ts.max().date()
+
+    return None, None
 
 
 def load_plant_workbook(uploaded_file) -> Dict:
@@ -694,7 +705,6 @@ def load_plant_workbook(uploaded_file) -> Dict:
 
     measurements_df = None
     measurements_raw = None
-    measurements_diagnostics = {}
     if measure_sheet is not None:
         measurements_raw = read_excel_with_detected_header(
             xls=xls,
@@ -702,19 +712,17 @@ def load_plant_workbook(uploaded_file) -> Dict:
             aliases_dict=MEASURE_ALIASES,
             min_found=4,
         )
-        if not measurements_raw.empty:
-            measurements_df, measurements_diagnostics = prepare_measurements_from_sheet(measurements_raw)
+        if measurements_raw is not None and not measurements_raw.empty:
+            measurements_df = prepare_measurements_from_sheet(measurements_raw, local_timezone=LOCAL_TIMEZONE)
 
     return {
         "config_sheet_name": config_sheet,
         "measure_sheet_name": measure_sheet,
         "config_raw_df": config_df,
         "measurements_raw_df": measurements_raw,
-        "measurements_diagnostics": measurements_diagnostics,
         "plant_cfg": plant_cfg,
         "measurements_df": measurements_df,
     }
-
 
 # ----------------------------
 # API helpers
@@ -807,7 +815,7 @@ def build_open_meteo_params(cfg: Dict, lat: float, lon: float, tilt: float, azim
         "hourly": ",".join(hourly_vars),
         "tilt": tilt,
         "azimuth": azimuth,
-        "timezone": "GMT",
+        "timezone": LOCAL_TIMEZONE,
         "wind_speed_unit": "ms",
         "temperature_unit": "celsius",
     }
@@ -826,8 +834,23 @@ def fetch_open_meteo_hourly(cfg: Dict, lat: float, lon: float, tilt: float, azim
     if not hourly or "time" not in hourly:
         raise ValueError("Open-Meteo non ha restituito dati orari.")
     df = pd.DataFrame(hourly)
-    df["timestamp_utc"] = pd.to_datetime(df["time"], utc=True)
-    for c in [c for c in df.columns if c not in {"time", "timestamp_utc"}]:
+    # Open-Meteo restituisce gli orari nella timezone richiesta. Li interpreto come locali e poi li converto in UTC.
+    ts_local = pd.to_datetime(df["time"], errors="coerce")
+    try:
+        df["timestamp_local"] = ts_local.dt.tz_localize(
+            LOCAL_TIMEZONE,
+            ambiguous="infer",
+            nonexistent="shift_forward",
+        )
+    except Exception:
+        df["timestamp_local"] = ts_local.dt.tz_localize(
+            LOCAL_TIMEZONE,
+            ambiguous="NaT",
+            nonexistent="shift_forward",
+        )
+        df = df.dropna(subset=["timestamp_local"]).copy()
+    df["timestamp_utc"] = df["timestamp_local"].dt.tz_convert("UTC")
+    for c in [c for c in df.columns if c not in {"time", "timestamp_local", "timestamp_utc"}]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["source"] = "Open-Meteo"
     return df
@@ -856,7 +879,7 @@ def aggregate_pvgis_baseline(df: pd.DataFrame, percentile: float, plant_code: st
         errors="coerce",
     )
     agg = agg.dropna(subset=["baseline_timestamp_utc"]).sort_values("baseline_timestamp_utc").reset_index(drop=True)
-    agg["mdh_key"] = agg["baseline_timestamp_utc"].dt.strftime("%m-%d %H:00")
+    agg["mdh_key"] = agg["baseline_timestamp_utc"].dt.tz_convert(LOCAL_TIMEZONE).dt.strftime("%m-%d %H:00")
     agg.insert(0, "codice_impianto", plant_code)
     agg.insert(1, "baseline_percentile", p)
     return agg
@@ -864,10 +887,14 @@ def aggregate_pvgis_baseline(df: pd.DataFrame, percentile: float, plant_code: st
 
 def add_common_time_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["month"] = df["timestamp_utc"].dt.month
-    df["day"] = df["timestamp_utc"].dt.day
-    df["hour"] = df["timestamp_utc"].dt.hour
-    df["mdh_key"] = df["timestamp_utc"].dt.strftime("%m-%d %H:00")
+    if "timestamp_local" in df.columns:
+        ts = df["timestamp_local"]
+    else:
+        ts = df["timestamp_utc"].dt.tz_convert(LOCAL_TIMEZONE)
+    df["month"] = ts.dt.month
+    df["day"] = ts.dt.day
+    df["hour"] = ts.dt.hour
+    df["mdh_key"] = ts.dt.strftime("%m-%d %H:00")
     return df
 
 
@@ -1191,7 +1218,6 @@ def app_ui() -> None:
 
     today_minus_7 = date.today() - timedelta(days=7)
     default_recent_start = today_minus_7 - timedelta(days=2)
-    default_recent_end = today_minus_7
 
     st.markdown("### A. File impianto")
     uploaded_plant_file = st.file_uploader(
@@ -1213,7 +1239,6 @@ def app_ui() -> None:
             measurements_from_file = parsed_workbook["measurements_df"]
             config_raw_sheet = parsed_workbook["config_raw_df"]
             measurements_raw_sheet = parsed_workbook["measurements_raw_df"]
-            measurements_diagnostics = parsed_workbook.get("measurements_diagnostics", {})
 
             st.success(
                 f"File caricato correttamente. Foglio configurazione: {parsed_workbook['config_sheet_name']}. "
@@ -1228,9 +1253,12 @@ def app_ui() -> None:
                 st.caption(
                     f"Misure trovate: {len(measurements_from_file)} righe orarie dopo il riempimento dei buchi con zero."
                 )
-                if measurements_diagnostics:
-                    with st.expander("Diagnostica misure caricate", expanded=False):
-                        st.dataframe(pd.DataFrame([measurements_diagnostics]), use_container_width=True)
+                local_start, local_end = get_measurement_local_date_range(measurements_from_file)
+                if local_start and local_end:
+                    st.info(
+                        f"Date meteo sincronizzate con il file misure in ora locale {LOCAL_TIMEZONE}: "
+                        f"dal {local_start.isoformat()} al {local_end.isoformat()}."
+                    )
         except Exception as exc:
             st.error(f"Errore nel file impianto: {exc}")
             return
@@ -1238,9 +1266,20 @@ def app_ui() -> None:
         st.warning("Il file impianto con foglio configurazione è obbligatorio.")
         return
 
+    measurement_start_date, measurement_end_date = get_measurement_local_date_range(measurements_from_file)
+    meteo_default_start = measurement_start_date or default_recent_start
+    meteo_default_end = measurement_end_date or today_minus_7
+
     default_token = None
     if uploaded_plant_file is not None:
         default_token = f"{uploaded_plant_file.name}_{uploaded_plant_file.size}"
+
+    # Sincronizza anche i widget visibili nella sezione D quando viene caricato/cambiato file.
+    sync_token = f"{default_token}_{measurement_start_date}_{measurement_end_date}"
+    if st.session_state.get("last_measurement_date_sync_token") != sync_token:
+        st.session_state["recent_start_date"] = meteo_default_start
+        st.session_state["recent_end_date"] = meteo_default_end
+        st.session_state["last_measurement_date_sync_token"] = sync_token
 
     with st.form("verification_form"):
         st.markdown("### B. Configurazione impianto")
@@ -1302,17 +1341,9 @@ def app_ui() -> None:
 
         r1, r2 = st.columns(2)
         with r1:
-            recent_start_date = st.date_input(
-                "Data iniziale meteo recente",
-                value=default_recent_start,
-                help="Se il file misure è presente, viene proposta automaticamente la data minima delle misure.",
-            )
+            recent_start_date = st.date_input("Data iniziale meteo recente", value=meteo_default_start, key="recent_start_date")
         with r2:
-            recent_end_date = st.date_input(
-                "Data finale meteo recente",
-                value=default_recent_end,
-                help="Se il file misure è presente, viene proposta automaticamente la data massima delle misure.",
-            )
+            recent_end_date = st.date_input("Data finale meteo recente", value=meteo_default_end, key="recent_end_date")
 
         if source_name == "Open-Meteo":
             open_meteo_hourly_variables = st.multiselect(
@@ -1363,9 +1394,12 @@ def app_ui() -> None:
             "components": bool(components),
         }
         baseline_cfg = {"startyear": int(startyear), "endyear": int(endyear), "percentile": int(percentile)}
+        # Queste sono le stesse date mostrate nei widget della sezione D.
+        # Se il foglio misure è presente, sono sincronizzate con min/max locali del file.
         recent_cfg = {
             "start_date": recent_start_date,
             "end_date": recent_end_date,
+            "local_timezone": LOCAL_TIMEZONE,
             "nasa_parameters": nasa_parameters,
             "open_meteo_hourly_variables": open_meteo_hourly_variables,
         }
@@ -1438,16 +1472,9 @@ def app_ui() -> None:
         comparison_df = compare_expected_vs_measured(expected_recent, monitoring_prepared, baseline_percentile)
         kpi_df = summarize_kpis(comparison_df, source_name, int(percentile))
 
-        diagnostics_rows = []
-        if "measurements_diagnostics" in locals() and measurements_diagnostics:
-            diagnostics_rows = [
-                {"section": "measurement_diagnostics", "key": k, "value": v}
-                for k, v in measurements_diagnostics.items()
-            ]
-
         config_rows = [
             {"section": "plant", "key": k, "value": v} for k, v in plant_cfg.items()
-        ] + diagnostics_rows + [
+        ] + [
             {"section": "baseline", "key": k, "value": v} for k, v in baseline_cfg.items()
         ] + [
             {"section": "recent_weather", "key": k, "value": v.isoformat() if hasattr(v, "isoformat") else v}
@@ -1487,6 +1514,7 @@ def app_ui() -> None:
         st.subheader("Prime righe del confronto")
         view_cols = [
             c for c in [
+                "timestamp_local",
                 "timestamp_utc",
                 "expected_energy_kwh",
                 "baseline_energy_kwh",
@@ -1508,7 +1536,8 @@ def app_ui() -> None:
         chart_df = comparison_df.copy().sort_values("timestamp_utc")
         chart_cols = [c for c in ["expected_energy_kwh", "baseline_energy_kwh", "measured_energy_kwh"] if c in chart_df.columns]
         if chart_cols:
-            line_df = chart_df[["timestamp_utc"] + chart_cols].set_index("timestamp_utc")
+            chart_time_col = "timestamp_local" if "timestamp_local" in chart_df.columns else "timestamp_utc"
+            line_df = chart_df[[chart_time_col] + chart_cols].set_index(chart_time_col)
             st.line_chart(line_df, height=360)
         else:
             st.info("Non ci sono abbastanza dati per il grafico orario.")
@@ -1535,7 +1564,7 @@ def app_ui() -> None:
             st.write(
                 "Open-Meteo usa GTI oraria se disponibile; NASA POWER usa GHI come proxy semplice dell'irraggiamento sul piano. "
                 "La baseline PVGIS viene convertita da P [W] a baseline_energy_kwh su base oraria dividendo per 1000. "
-                "Le misure del file impianto sono lette come Potenza misurata [kW] oraria: i buchi dell'intervallo vengono riempiti con zero. "
+                "Le misure del file impianto sono lette come Potenza misurata [kW] oraria in ora locale Europe/Rome: i buchi dell'intervallo vengono riempiti con zero e i timestamp sono poi convertiti in UTC per l'allineamento. "
                 "Per il confronto orario, kW medi orari e kWh dell'ora vengono assunti numericamente equivalenti."
             )
     except requests.HTTPError as exc:
@@ -1556,4 +1585,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
