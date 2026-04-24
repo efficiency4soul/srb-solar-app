@@ -414,8 +414,70 @@ MEASURE_ALIASES = {
     "month": ["mese", "month"],
     "day": ["giorno", "day"],
     "hour": ["ora", "hour"],
-    "power_kw": ["potenza_misurata_kw", "potenza_kw", "power_kw", "kw", "potenza"],
+    "power_kw": [
+        "potenza_misurata_kw",
+        "potenza misurata kw",
+        "potenza_misurata_kwh",
+        "potenza misurata kwh",
+        "potenza_kw",
+        "power_kw",
+        "power",
+        "kw",
+        "potenza",
+    ],
 }
+
+
+def find_header_row(
+    xls: pd.ExcelFile,
+    sheet_name: str,
+    aliases_dict: Dict[str, List[str]],
+    min_found: int = 4,
+    max_rows: int = 50,
+) -> Optional[int]:
+    """Trova la riga di intestazione anche se prima ci sono titolo, note o righe vuote."""
+    preview = pd.read_excel(xls, sheet_name=sheet_name, header=None, nrows=max_rows)
+    alias_groups = list(aliases_dict.values())
+
+    for row_idx in range(len(preview)):
+        row_values = [normalize_text(v) for v in preview.iloc[row_idx].tolist() if not pd.isna(v)]
+        if not row_values:
+            continue
+
+        found = 0
+        for aliases in alias_groups:
+            aliases_norm = [normalize_text(a) for a in aliases]
+            if any(alias in row_values for alias in aliases_norm):
+                found += 1
+
+        if found >= min_found:
+            return row_idx
+
+    return None
+
+
+def read_excel_with_detected_header(
+    xls: pd.ExcelFile,
+    sheet_name: str,
+    aliases_dict: Dict[str, List[str]],
+    min_found: int = 4,
+) -> pd.DataFrame:
+    """Legge un foglio Excel usando la riga header individuata automaticamente."""
+    header_row = find_header_row(
+        xls=xls,
+        sheet_name=sheet_name,
+        aliases_dict=aliases_dict,
+        min_found=min_found,
+    )
+
+    if header_row is None:
+        df = pd.read_excel(xls, sheet_name=sheet_name)
+    else:
+        df = pd.read_excel(xls, sheet_name=sheet_name, header=header_row)
+
+    df = df.dropna(how="all").copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
 
 def detect_sheet_roles(xls: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]:
@@ -423,19 +485,16 @@ def detect_sheet_roles(xls: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]
     measure_sheet = None
 
     for sheet in xls.sheet_names:
-        sample = pd.read_excel(xls, sheet_name=sheet, nrows=20)
-        cols_norm = [normalize_text(c) for c in sample.columns]
-
-        has_measure_cols = (
-            any(c in cols_norm for c in ["anno", "year"])
-            and any(c in cols_norm for c in ["mese", "month"])
-            and any(c in cols_norm for c in ["giorno", "day"])
-            and any(c in cols_norm for c in ["ora", "hour"])
-        )
-
         sheet_name_norm = normalize_text(sheet)
 
-        if has_measure_cols and measure_sheet is None:
+        measure_header_row = find_header_row(
+            xls=xls,
+            sheet_name=sheet,
+            aliases_dict=MEASURE_ALIASES,
+            min_found=4,
+        )
+
+        if measure_header_row is not None and measure_sheet is None:
             measure_sheet = sheet
 
         if config_sheet is None:
@@ -516,6 +575,7 @@ def parse_plant_config_sheet(df: pd.DataFrame) -> Dict:
 
 def rename_measurement_columns(df: pd.DataFrame) -> pd.DataFrame:
     renamed = df.copy()
+    renamed.columns = [str(c).strip() for c in renamed.columns]
     norm_map = {normalize_text(c): c for c in renamed.columns}
     rename_dict = {}
 
@@ -530,7 +590,7 @@ def rename_measurement_columns(df: pd.DataFrame) -> pd.DataFrame:
     return renamed
 
 
-def prepare_measurements_from_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
+def prepare_measurements_from_sheet(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, object]]:
     df = rename_measurement_columns(raw_df)
 
     required = ["year", "month", "day", "hour", "power_kw"]
@@ -538,16 +598,21 @@ def prepare_measurements_from_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(
             "Il foglio misure deve contenere le colonne anno, mese, giorno, ora e Potenza misurata in kW. "
-            f"Mancano: {', '.join(missing)}"
+            f"Mancano: {', '.join(missing)}. Colonne trovate: {', '.join(map(str, raw_df.columns))}"
         )
 
     df = df.copy()
+    initial_rows = len(df)
     for c in required:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df = df.dropna(subset=required).copy()
+    invalid_datetime_rows = int(df[["year", "month", "day", "hour"]].isna().any(axis=1).sum())
+    df = df.dropna(subset=["year", "month", "day", "hour"]).copy()
     if df.empty:
         raise ValueError("Il foglio misure è presente ma non contiene righe valide.")
+
+    power_null_or_invalid_rows = int(df["power_kw"].isna().sum())
+    df["power_kw"] = pd.to_numeric(df["power_kw"], errors="coerce").fillna(0.0)
 
     df["timestamp_utc"] = pd.to_datetime(
         dict(
@@ -560,26 +625,30 @@ def prepare_measurements_from_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
         utc=True,
     )
 
+    invalid_timestamp_rows = int(df["timestamp_utc"].isna().sum())
     df = df.dropna(subset=["timestamp_utc"]).copy()
     if df.empty:
         raise ValueError("Impossibile costruire timestamp validi dal foglio misure.")
 
-    df["measured_power_kw"] = pd.to_numeric(df["power_kw"], errors="coerce").fillna(0.0)
+    duplicate_hour_rows = int(df.duplicated(subset=["timestamp_utc"]).sum())
+    df["measured_power_kw"] = df["power_kw"]
     df = df.groupby("timestamp_utc", as_index=False)["measured_power_kw"].mean()
 
     full_index = pd.date_range(
         start=df["timestamp_utc"].min(),
         end=df["timestamp_utc"].max(),
-        freq="H",
+        freq="h",
         tz="UTC",
     )
 
+    rows_before_fill = len(df)
     df = (
         df.set_index("timestamp_utc")
         .reindex(full_index)
         .rename_axis("timestamp_utc")
         .reset_index()
     )
+    inserted_missing_hours = int(len(df) - rows_before_fill)
     df["measured_power_kw"] = pd.to_numeric(df["measured_power_kw"], errors="coerce").fillna(0.0)
 
     # per serie orarie, kW medi dell'ora ~= kWh nell'ora
@@ -590,7 +659,20 @@ def prepare_measurements_from_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
     df["day"] = df["timestamp_utc"].dt.day
     df["hour"] = df["timestamp_utc"].dt.hour
     df["mdh_key"] = df["timestamp_utc"].dt.strftime("%m-%d %H:00")
-    return df[["timestamp_utc", "year", "month", "day", "hour", "mdh_key", "measured_power_kw", "measured_energy_kwh"]]
+
+    diagnostics = {
+        "measurement_input_rows": int(initial_rows),
+        "measurement_valid_unique_hours": int(rows_before_fill),
+        "measurement_final_hourly_rows": int(len(df)),
+        "measurement_inserted_missing_hours_zero": inserted_missing_hours,
+        "measurement_invalid_datetime_rows_discarded": invalid_datetime_rows + invalid_timestamp_rows,
+        "measurement_invalid_power_rows_set_to_zero": power_null_or_invalid_rows,
+        "measurement_duplicate_hour_rows_averaged": duplicate_hour_rows,
+        "measurement_start_utc": df["timestamp_utc"].min().isoformat() if not df.empty else None,
+        "measurement_end_utc": df["timestamp_utc"].max().isoformat() if not df.empty else None,
+    }
+
+    return df[["timestamp_utc", "year", "month", "day", "hour", "mdh_key", "measured_power_kw", "measured_energy_kwh"]], diagnostics
 
 
 def load_plant_workbook(uploaded_file) -> Dict:
@@ -612,16 +694,23 @@ def load_plant_workbook(uploaded_file) -> Dict:
 
     measurements_df = None
     measurements_raw = None
+    measurements_diagnostics = {}
     if measure_sheet is not None:
-        measurements_raw = pd.read_excel(xls, sheet_name=measure_sheet)
+        measurements_raw = read_excel_with_detected_header(
+            xls=xls,
+            sheet_name=measure_sheet,
+            aliases_dict=MEASURE_ALIASES,
+            min_found=4,
+        )
         if not measurements_raw.empty:
-            measurements_df = prepare_measurements_from_sheet(measurements_raw)
+            measurements_df, measurements_diagnostics = prepare_measurements_from_sheet(measurements_raw)
 
     return {
         "config_sheet_name": config_sheet,
         "measure_sheet_name": measure_sheet,
         "config_raw_df": config_df,
         "measurements_raw_df": measurements_raw,
+        "measurements_diagnostics": measurements_diagnostics,
         "plant_cfg": plant_cfg,
         "measurements_df": measurements_df,
     }
@@ -1123,6 +1212,7 @@ def app_ui() -> None:
             measurements_from_file = parsed_workbook["measurements_df"]
             config_raw_sheet = parsed_workbook["config_raw_df"]
             measurements_raw_sheet = parsed_workbook["measurements_raw_df"]
+            measurements_diagnostics = parsed_workbook.get("measurements_diagnostics", {})
 
             st.success(
                 f"File caricato correttamente. Foglio configurazione: {parsed_workbook['config_sheet_name']}. "
@@ -1137,6 +1227,9 @@ def app_ui() -> None:
                 st.caption(
                     f"Misure trovate: {len(measurements_from_file)} righe orarie dopo il riempimento dei buchi con zero."
                 )
+                if measurements_diagnostics:
+                    with st.expander("Diagnostica misure caricate", expanded=False):
+                        st.dataframe(pd.DataFrame([measurements_diagnostics]), use_container_width=True)
         except Exception as exc:
             st.error(f"Errore nel file impianto: {exc}")
             return
@@ -1336,9 +1429,16 @@ def app_ui() -> None:
         comparison_df = compare_expected_vs_measured(expected_recent, monitoring_prepared, baseline_percentile)
         kpi_df = summarize_kpis(comparison_df, source_name, int(percentile))
 
+        diagnostics_rows = []
+        if "measurements_diagnostics" in locals() and measurements_diagnostics:
+            diagnostics_rows = [
+                {"section": "measurement_diagnostics", "key": k, "value": v}
+                for k, v in measurements_diagnostics.items()
+            ]
+
         config_rows = [
             {"section": "plant", "key": k, "value": v} for k, v in plant_cfg.items()
-        ] + [
+        ] + diagnostics_rows + [
             {"section": "baseline", "key": k, "value": v} for k, v in baseline_cfg.items()
         ] + [
             {"section": "recent_weather", "key": k, "value": v.isoformat() if hasattr(v, "isoformat") else v}
