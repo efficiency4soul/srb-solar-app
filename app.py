@@ -975,6 +975,106 @@ def summarize_kpis(comparison_df: pd.DataFrame, source_name: str, percentile: in
     }
     return pd.DataFrame([summary])
 
+def build_kpi_display_table(kpi_df: pd.DataFrame, measurements_present: bool) -> pd.DataFrame:
+    if kpi_df is None or kpi_df.empty or not measurements_present:
+        return pd.DataFrame(columns=["KPI", "Valore", "Unità"])
+
+    row = kpi_df.iloc[0]
+
+    def fmt(value, decimals=2):
+        try:
+            if pd.isna(value):
+                return "n.d."
+            return f"{float(value):,.{decimals}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        except Exception:
+            return "n.d."
+
+    def fmt_int(value):
+        try:
+            if pd.isna(value):
+                return "n.d."
+            return f"{int(value):,}".replace(",", ".")
+        except Exception:
+            return "n.d."
+
+    return pd.DataFrame([
+        {"KPI": "Energia attesa totale", "Valore": fmt(row.get("expected_energy_total_kwh")), "Unità": "kWh"},
+        {"KPI": "Energia misurata totale", "Valore": fmt(row.get("measured_energy_total_kwh")), "Unità": "kWh"},
+        {"KPI": "Scostamento medio", "Valore": fmt(row.get("mean_deviation_pct")), "Unità": "%"},
+        {"KPI": "Scostamento mediano", "Valore": fmt(row.get("median_deviation_pct")), "Unità": "%"},
+        {"KPI": "Performance ratio proxy medio", "Valore": fmt(row.get("mean_performance_ratio_proxy")), "Unità": "-"},
+        {"KPI": "Ore con misure", "Valore": fmt_int(row.get("hours_with_measurements")), "Unità": "h"},
+        {"KPI": "Ore con scostamento < -15%", "Valore": fmt_int(row.get("hours_large_negative_deviation_lt_minus_15pct")), "Unità": "h"},
+    ])
+
+
+def build_kpi_legend_table() -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "KPI": "Energia attesa totale",
+            "Formula": "Somma di expected_energy_kwh sul periodo",
+            "Descrizione": "Produzione FV oraria stimata usando meteo recente, potenza di picco, perdite e correzione temperatura.",
+        },
+        {
+            "KPI": "Energia misurata totale",
+            "Formula": "Somma di measured_energy_kwh sul periodo",
+            "Descrizione": "Energia ricavata dalle misure caricate. L'app assume che la potenza media oraria in kW sia numericamente equivalente ai kWh dell'ora.",
+        },
+        {
+            "KPI": "Scostamento orario",
+            "Formula": "deviation_pct = (measured_energy_kwh - expected_energy_kwh) / expected_energy_kwh * 100",
+            "Descrizione": "Scostamento percentuale tra produzione misurata e produzione attesa per ogni ora con expected_energy_kwh diverso da zero.",
+        },
+        {
+            "KPI": "Scostamento medio",
+            "Formula": "Media di deviation_pct",
+            "Descrizione": "Media aritmetica degli scostamenti percentuali orari. Valori negativi indicano produzione misurata inferiore all'attesa.",
+        },
+        {
+            "KPI": "Scostamento mediano",
+            "Formula": "Mediana di deviation_pct",
+            "Descrizione": "Valore centrale degli scostamenti percentuali orari; è meno sensibile agli outlier rispetto alla media.",
+        },
+        {
+            "KPI": "Performance ratio proxy medio",
+            "Formula": "Media di measured_energy_kwh / expected_energy_kwh",
+            "Descrizione": "Indicatore sintetico del rapporto tra produzione misurata e attesa. Valori inferiori a 1 indicano produzione sotto l'atteso.",
+        },
+        {
+            "KPI": "Ore con misure",
+            "Formula": "Conteggio ore con measured_energy_kwh valorizzato",
+            "Descrizione": "Numero di ore del periodo confrontate con la serie misurata caricata.",
+        },
+        {
+            "KPI": "Ore con scostamento < -15%",
+            "Formula": "Conteggio ore in cui deviation_pct < -15",
+            "Descrizione": "Ore potenzialmente critiche: la produzione misurata risulta almeno del 15% inferiore all'attesa.",
+        },
+        {
+            "KPI": "Delta atteso vs baseline",
+            "Formula": "(expected_energy_kwh - baseline_energy_kwh) / baseline_energy_kwh * 100",
+            "Descrizione": "Scostamento tra produzione attesa con meteo recente e baseline storica PVGIS al percentile selezionato.",
+        },
+    ])
+
+
+def render_kpi_output_section(kpi_df: pd.DataFrame, measurements_present: bool) -> None:
+    if not measurements_present:
+        st.info("KPI misurato vs atteso non disponibili: nessun foglio misure caricato. Viene mantenuto solo il confronto atteso vs baseline.")
+        return
+
+    st.subheader("KPI sintetici misurato vs atteso")
+    st.dataframe(build_kpi_display_table(kpi_df, measurements_present=True), use_container_width=True, hide_index=True)
+
+    with st.expander("Legenda KPI e formule di calcolo", expanded=False):
+        st.dataframe(build_kpi_legend_table(), use_container_width=True, hide_index=True)
+        st.markdown(
+            """
+**Nota:** i KPI percentuali vengono calcolati solo dove l'energia attesa oraria è diversa da zero.  
+Per la serie misurata, l'app considera il valore orario in kW come potenza media dell'ora, quindi numericamente equivalente all'energia dell'ora in kWh.
+            """
+        )
+
 
 def to_excel_bytes(
     config_rows: List[Dict],
@@ -1003,6 +1103,7 @@ def to_excel_bytes(
         if monitoring_prepared is not None:
             remove_timezone_for_excel(monitoring_prepared).to_excel(writer, sheet_name="MONITORING_PREPARED", index=False)
         kpi_df.to_excel(writer, sheet_name="KPI_SUMMARY", index=False)
+        build_kpi_legend_table().to_excel(writer, sheet_name="KPI_LEGEND", index=False)
 
         workbook = writer.book
         for ws in workbook.worksheets:
@@ -1559,8 +1660,7 @@ def app_ui() -> None:
         progress.progress(100, text="Elaborazione completata")
         status.success("Output pronto")
 
-        st.subheader("KPI sintetici")
-        st.dataframe(kpi_df, use_container_width=True)
+        render_kpi_output_section(kpi_df, monitoring_prepared is not None)
 
         st.subheader("Prime righe del confronto")
         view_cols = [
@@ -1633,4 +1733,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
