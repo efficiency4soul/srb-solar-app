@@ -22,7 +22,6 @@ DEFAULT_OUTPUT_NAME = "srb_solar_verification_output.xlsx"
 PVGIS_BASE_URL = "https://re.jrc.ec.europa.eu/api/v5_3/seriescalc"
 NASA_BASE_URL = "https://power.larc.nasa.gov/api/temporal/hourly/point"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
-LOCAL_TIMEZONE = "Europe/Rome"
 
 PVGIS_DB_YEAR_LIMITS = {
     "PVGIS-SARAH2": (2005, 2020),
@@ -415,7 +414,17 @@ MEASURE_ALIASES = {
     "month": ["mese", "month"],
     "day": ["giorno", "day"],
     "hour": ["ora", "hour"],
-    "power_kw": ["potenza_misurata_kw", "potenza misurata kw", "potenza_kw", "power_kw", "power", "kw", "potenza"],
+    "power_kw": [
+        "potenza_misurata_kw",
+        "potenza misurata kw",
+        "potenza_misurata_kwh",
+        "potenza misurata kwh",
+        "potenza_kw",
+        "power_kw",
+        "power",
+        "kw",
+        "potenza",
+    ],
 }
 
 
@@ -426,17 +435,21 @@ def find_header_row(
     min_found: int = 4,
     max_rows: int = 50,
 ) -> Optional[int]:
-    """Trova la riga di intestazione anche se il foglio ha titolo/istruzioni sopra la tabella."""
+    """Trova la riga di intestazione anche se prima ci sono titolo, note o righe vuote."""
     preview = pd.read_excel(xls, sheet_name=sheet_name, header=None, nrows=max_rows)
     alias_groups = list(aliases_dict.values())
 
     for row_idx in range(len(preview)):
         row_values = [normalize_text(v) for v in preview.iloc[row_idx].tolist() if not pd.isna(v)]
+        if not row_values:
+            continue
+
         found = 0
         for aliases in alias_groups:
             aliases_norm = [normalize_text(a) for a in aliases]
             if any(alias in row_values for alias in aliases_norm):
                 found += 1
+
         if found >= min_found:
             return row_idx
 
@@ -449,6 +462,7 @@ def read_excel_with_detected_header(
     aliases_dict: Dict[str, List[str]],
     min_found: int = 4,
 ) -> pd.DataFrame:
+    """Legge un foglio Excel usando la riga header individuata automaticamente."""
     header_row = find_header_row(
         xls=xls,
         sheet_name=sheet_name,
@@ -488,6 +502,7 @@ def detect_sheet_roles(xls: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]
                 config_sheet = sheet
 
     if config_sheet is None:
+        # fallback: il primo foglio che non sia misure
         for sheet in xls.sheet_names:
             if sheet != measure_sheet:
                 config_sheet = sheet
@@ -499,6 +514,7 @@ def detect_sheet_roles(xls: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]
 def dataframe_to_key_value(df: pd.DataFrame) -> Dict[str, object]:
     out = {}
 
+    # caso 1: prime due colonne key/value
     if df.shape[1] >= 2:
         c0 = df.columns[0]
         c1 = df.columns[1]
@@ -507,6 +523,7 @@ def dataframe_to_key_value(df: pd.DataFrame) -> Dict[str, object]:
             if key:
                 out[key] = row[c1]
 
+    # caso 2: una riga con intestazioni = chiavi
     if df.shape[0] >= 1:
         first_row = df.iloc[0].to_dict()
         for k, v in first_row.items():
@@ -532,6 +549,7 @@ def parse_plant_config_sheet(df: pd.DataFrame) -> Dict:
     for target_key, aliases in CONFIG_ALIASES.items():
         cfg[target_key] = pick_value_from_aliases(raw_kv, aliases)
 
+    # default robusti
     cfg["codice_impianto"] = cfg["codice_impianto"] or "SRB_xxx"
     cfg["lat"] = safe_float(cfg["lat"], None)
     cfg["lon"] = safe_float(cfg["lon"], None)
@@ -572,7 +590,7 @@ def rename_measurement_columns(df: pd.DataFrame) -> pd.DataFrame:
     return renamed
 
 
-def prepare_measurements_from_sheet(raw_df: pd.DataFrame, local_timezone: str = LOCAL_TIMEZONE) -> pd.DataFrame:
+def prepare_measurements_from_sheet(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, object]]:
     df = rename_measurement_columns(raw_df)
 
     required = ["year", "month", "day", "hour", "power_kw"]
@@ -580,20 +598,23 @@ def prepare_measurements_from_sheet(raw_df: pd.DataFrame, local_timezone: str = 
     if missing:
         raise ValueError(
             "Il foglio misure deve contenere le colonne anno, mese, giorno, ora e Potenza misurata in kW. "
-            f"Mancano: {', '.join(missing)}"
+            f"Mancano: {', '.join(missing)}. Colonne trovate: {', '.join(map(str, raw_df.columns))}"
         )
 
     df = df.copy()
+    initial_rows = len(df)
     for c in required:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    invalid_datetime_rows = int(df[["year", "month", "day", "hour"]].isna().any(axis=1).sum())
     df = df.dropna(subset=["year", "month", "day", "hour"]).copy()
     if df.empty:
         raise ValueError("Il foglio misure è presente ma non contiene righe valide.")
 
+    power_null_or_invalid_rows = int(df["power_kw"].isna().sum())
     df["power_kw"] = pd.to_numeric(df["power_kw"], errors="coerce").fillna(0.0)
 
-    df["timestamp_local"] = pd.to_datetime(
+    df["timestamp_utc"] = pd.to_datetime(
         dict(
             year=df["year"].astype(int),
             month=df["month"].astype(int),
@@ -601,89 +622,57 @@ def prepare_measurements_from_sheet(raw_df: pd.DataFrame, local_timezone: str = 
             hour=df["hour"].astype(int),
         ),
         errors="coerce",
+        utc=True,
     )
 
-    df = df.dropna(subset=["timestamp_local"]).copy()
+    invalid_timestamp_rows = int(df["timestamp_utc"].isna().sum())
+    df = df.dropna(subset=["timestamp_utc"]).copy()
     if df.empty:
         raise ValueError("Impossibile costruire timestamp validi dal foglio misure.")
 
-    try:
-        df["timestamp_local"] = df["timestamp_local"].dt.tz_localize(
-            local_timezone,
-            ambiguous="infer",
-            nonexistent="shift_forward",
-        )
-    except Exception:
-        df["timestamp_local"] = df["timestamp_local"].dt.tz_localize(
-            local_timezone,
-            ambiguous="NaT",
-            nonexistent="shift_forward",
-        )
-        df = df.dropna(subset=["timestamp_local"]).copy()
-
-    df["timestamp_utc"] = df["timestamp_local"].dt.tz_convert("UTC")
+    duplicate_hour_rows = int(df.duplicated(subset=["timestamp_utc"]).sum())
     df["measured_power_kw"] = df["power_kw"]
+    df = df.groupby("timestamp_utc", as_index=False)["measured_power_kw"].mean()
 
-    df = (
-        df.groupby(["timestamp_utc", "timestamp_local"], as_index=False)["measured_power_kw"]
-        .mean()
-        .sort_values("timestamp_utc")
-    )
-
-    full_index_utc = pd.date_range(
+    full_index = pd.date_range(
         start=df["timestamp_utc"].min(),
         end=df["timestamp_utc"].max(),
         freq="h",
         tz="UTC",
     )
 
+    rows_before_fill = len(df)
     df = (
         df.set_index("timestamp_utc")
-        .reindex(full_index_utc)
+        .reindex(full_index)
         .rename_axis("timestamp_utc")
         .reset_index()
     )
-
-    df["timestamp_local"] = df["timestamp_utc"].dt.tz_convert(local_timezone)
+    inserted_missing_hours = int(len(df) - rows_before_fill)
     df["measured_power_kw"] = pd.to_numeric(df["measured_power_kw"], errors="coerce").fillna(0.0)
+
+    # per serie orarie, kW medi dell'ora ~= kWh nell'ora
     df["measured_energy_kwh"] = df["measured_power_kw"]
 
-    df["year"] = df["timestamp_local"].dt.year
-    df["month"] = df["timestamp_local"].dt.month
-    df["day"] = df["timestamp_local"].dt.day
-    df["hour"] = df["timestamp_local"].dt.hour
-    df["local_date"] = df["timestamp_local"].dt.date
-    df["mdh_key"] = df["timestamp_local"].dt.strftime("%m-%d %H:00")
+    df["year"] = df["timestamp_utc"].dt.year
+    df["month"] = df["timestamp_utc"].dt.month
+    df["day"] = df["timestamp_utc"].dt.day
+    df["hour"] = df["timestamp_utc"].dt.hour
+    df["mdh_key"] = df["timestamp_utc"].dt.strftime("%m-%d %H:00")
 
-    return df[
-        [
-            "timestamp_utc",
-            "timestamp_local",
-            "year",
-            "month",
-            "day",
-            "hour",
-            "local_date",
-            "mdh_key",
-            "measured_power_kw",
-            "measured_energy_kwh",
-        ]
-    ]
+    diagnostics = {
+        "measurement_input_rows": int(initial_rows),
+        "measurement_valid_unique_hours": int(rows_before_fill),
+        "measurement_final_hourly_rows": int(len(df)),
+        "measurement_inserted_missing_hours_zero": inserted_missing_hours,
+        "measurement_invalid_datetime_rows_discarded": invalid_datetime_rows + invalid_timestamp_rows,
+        "measurement_invalid_power_rows_set_to_zero": power_null_or_invalid_rows,
+        "measurement_duplicate_hour_rows_averaged": duplicate_hour_rows,
+        "measurement_start_utc": df["timestamp_utc"].min().isoformat() if not df.empty else None,
+        "measurement_end_utc": df["timestamp_utc"].max().isoformat() if not df.empty else None,
+    }
 
-
-def get_measurement_local_date_range(measurements_df: Optional[pd.DataFrame]) -> Tuple[Optional[date], Optional[date]]:
-    if measurements_df is None or measurements_df.empty:
-        return None, None
-
-    if "timestamp_local" in measurements_df.columns:
-        local_ts = measurements_df["timestamp_local"]
-        return local_ts.min().date(), local_ts.max().date()
-
-    if "timestamp_utc" in measurements_df.columns:
-        local_ts = measurements_df["timestamp_utc"].dt.tz_convert(LOCAL_TIMEZONE)
-        return local_ts.min().date(), local_ts.max().date()
-
-    return None, None
+    return df[["timestamp_utc", "year", "month", "day", "hour", "mdh_key", "measured_power_kw", "measured_energy_kwh"]], diagnostics
 
 
 def load_plant_workbook(uploaded_file) -> Dict:
@@ -705,6 +694,7 @@ def load_plant_workbook(uploaded_file) -> Dict:
 
     measurements_df = None
     measurements_raw = None
+    measurements_diagnostics = {}
     if measure_sheet is not None:
         measurements_raw = read_excel_with_detected_header(
             xls=xls,
@@ -712,17 +702,19 @@ def load_plant_workbook(uploaded_file) -> Dict:
             aliases_dict=MEASURE_ALIASES,
             min_found=4,
         )
-        if measurements_raw is not None and not measurements_raw.empty:
-            measurements_df = prepare_measurements_from_sheet(measurements_raw, local_timezone=LOCAL_TIMEZONE)
+        if not measurements_raw.empty:
+            measurements_df, measurements_diagnostics = prepare_measurements_from_sheet(measurements_raw)
 
     return {
         "config_sheet_name": config_sheet,
         "measure_sheet_name": measure_sheet,
         "config_raw_df": config_df,
         "measurements_raw_df": measurements_raw,
+        "measurements_diagnostics": measurements_diagnostics,
         "plant_cfg": plant_cfg,
         "measurements_df": measurements_df,
     }
+
 
 # ----------------------------
 # API helpers
@@ -815,7 +807,7 @@ def build_open_meteo_params(cfg: Dict, lat: float, lon: float, tilt: float, azim
         "hourly": ",".join(hourly_vars),
         "tilt": tilt,
         "azimuth": azimuth,
-        "timezone": LOCAL_TIMEZONE,
+        "timezone": "GMT",
         "wind_speed_unit": "ms",
         "temperature_unit": "celsius",
     }
@@ -834,23 +826,8 @@ def fetch_open_meteo_hourly(cfg: Dict, lat: float, lon: float, tilt: float, azim
     if not hourly or "time" not in hourly:
         raise ValueError("Open-Meteo non ha restituito dati orari.")
     df = pd.DataFrame(hourly)
-    # Open-Meteo restituisce gli orari nella timezone richiesta. Li interpreto come locali e poi li converto in UTC.
-    ts_local = pd.to_datetime(df["time"], errors="coerce")
-    try:
-        df["timestamp_local"] = ts_local.dt.tz_localize(
-            LOCAL_TIMEZONE,
-            ambiguous="infer",
-            nonexistent="shift_forward",
-        )
-    except Exception:
-        df["timestamp_local"] = ts_local.dt.tz_localize(
-            LOCAL_TIMEZONE,
-            ambiguous="NaT",
-            nonexistent="shift_forward",
-        )
-        df = df.dropna(subset=["timestamp_local"]).copy()
-    df["timestamp_utc"] = df["timestamp_local"].dt.tz_convert("UTC")
-    for c in [c for c in df.columns if c not in {"time", "timestamp_local", "timestamp_utc"}]:
+    df["timestamp_utc"] = pd.to_datetime(df["time"], utc=True)
+    for c in [c for c in df.columns if c not in {"time", "timestamp_utc"}]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["source"] = "Open-Meteo"
     return df
@@ -879,7 +856,7 @@ def aggregate_pvgis_baseline(df: pd.DataFrame, percentile: float, plant_code: st
         errors="coerce",
     )
     agg = agg.dropna(subset=["baseline_timestamp_utc"]).sort_values("baseline_timestamp_utc").reset_index(drop=True)
-    agg["mdh_key"] = agg["baseline_timestamp_utc"].dt.tz_convert(LOCAL_TIMEZONE).dt.strftime("%m-%d %H:00")
+    agg["mdh_key"] = agg["baseline_timestamp_utc"].dt.strftime("%m-%d %H:00")
     agg.insert(0, "codice_impianto", plant_code)
     agg.insert(1, "baseline_percentile", p)
     return agg
@@ -887,14 +864,10 @@ def aggregate_pvgis_baseline(df: pd.DataFrame, percentile: float, plant_code: st
 
 def add_common_time_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    if "timestamp_local" in df.columns:
-        ts = df["timestamp_local"]
-    else:
-        ts = df["timestamp_utc"].dt.tz_convert(LOCAL_TIMEZONE)
-    df["month"] = ts.dt.month
-    df["day"] = ts.dt.day
-    df["hour"] = ts.dt.hour
-    df["mdh_key"] = ts.dt.strftime("%m-%d %H:00")
+    df["month"] = df["timestamp_utc"].dt.month
+    df["day"] = df["timestamp_utc"].dt.day
+    df["hour"] = df["timestamp_utc"].dt.hour
+    df["mdh_key"] = df["timestamp_utc"].dt.strftime("%m-%d %H:00")
     return df
 
 
@@ -1216,29 +1189,205 @@ def app_ui() -> None:
     with st.expander("Run elaborazioni", expanded=False):
         render_runs_ui(user)
 
+    # ---------------------------------------------------------
+    # Default UI state
+    # ---------------------------------------------------------
     today_minus_7 = date.today() - timedelta(days=7)
     default_recent_start = today_minus_7 - timedelta(days=2)
 
-    st.markdown("### A. File impianto")
+    # Applica eventuali valori derivati dal file caricato nel run precedente.
+    # Lo facciamo qui, prima di istanziare i widget, perché Streamlit non permette
+    # di modificare lo stato di un widget dopo che è stato creato nello stesso run.
+    pending_defaults = st.session_state.pop("pending_ui_defaults", None)
+    if pending_defaults:
+        for k, v in pending_defaults.items():
+            st.session_state[k] = v
+
+    st.session_state.setdefault("ui_codice_impianto", "SRB_xxx")
+    st.session_state.setdefault("ui_lat", 41.8927524)
+    st.session_state.setdefault("ui_lon", 12.4853054)
+    st.session_state.setdefault("ui_peakpower", 1.0)
+    st.session_state.setdefault("ui_loss", 14.0)
+    st.session_state.setdefault("ui_pvtechchoice", "crystSi")
+    st.session_state.setdefault("ui_mountingplace", "free")
+    st.session_state.setdefault("ui_optimalangles", False)
+    st.session_state.setdefault("ui_angle", 30.0)
+    st.session_state.setdefault("ui_aspect", 0.0)
+    st.session_state.setdefault("ui_tracking_mode", "fixed")
+    st.session_state.setdefault("ui_raddatabase", "PVGIS-SARAH3")
+    st.session_state.setdefault("ui_startyear", 2005)
+    st.session_state.setdefault("ui_endyear", 2023)
+    st.session_state.setdefault("ui_usehorizon", True)
+    st.session_state.setdefault("ui_components", True)
+    st.session_state.setdefault("ui_percentile", 50)
+    st.session_state.setdefault("weather_source", "Open-Meteo")
+    st.session_state.setdefault("ui_recent_start_date", default_recent_start)
+    st.session_state.setdefault("ui_recent_end_date", today_minus_7)
+    st.session_state.setdefault("open_meteo_vars", OPEN_METEO_RECOMMENDED_DEFAULT)
+    st.session_state.setdefault(
+        "nasa_power_vars",
+        ["ALLSKY_SFC_SW_DWN", "T2M", "WS10M", "ALLSKY_SFC_SW_DNI", "ALLSKY_SFC_SW_DIFF"],
+    )
+
+    # Se il DB PVGIS selezionato cambia, mantieni gli anni nei limiti ammessi.
+    min_year, max_year = get_db_year_limits(st.session_state["ui_raddatabase"])
+    st.session_state["ui_startyear"] = min(max(int(st.session_state["ui_startyear"]), min_year), max_year)
+    st.session_state["ui_endyear"] = min(max(int(st.session_state["ui_endyear"]), min_year), max_year)
+
+    # ---------------------------------------------------------
+    # A. Configurazione impianto e meteo PRIMA del caricamento file
+    # ---------------------------------------------------------
+    st.markdown("### A. Configurazione impianto")
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        codice_impianto = st.text_input("Codice impianto", key="ui_codice_impianto")
+        lat = st.number_input("Latitudine", format="%.7f", key="ui_lat")
+        lon = st.number_input("Longitudine", format="%.7f", key="ui_lon")
+        peakpower = st.number_input("Peak power [kWp]", min_value=0.0, step=0.1, key="ui_peakpower")
+        loss = st.number_input("Loss [%]", min_value=0.0, max_value=100.0, step=0.5, key="ui_loss")
+    with a2:
+        pvtech_options = ["crystSi", "CIS", "CdTe", "Unknown"]
+        if st.session_state["ui_pvtechchoice"] not in pvtech_options:
+            st.session_state["ui_pvtechchoice"] = "crystSi"
+        pvtechchoice = st.selectbox("Tecnologia pannello", pvtech_options, key="ui_pvtechchoice")
+
+        mounting_options = ["free", "building"]
+        if st.session_state["ui_mountingplace"] not in mounting_options:
+            st.session_state["ui_mountingplace"] = "free"
+        mountingplace = st.selectbox("Tipo di montaggio", mounting_options, key="ui_mountingplace")
+
+        optimalangles = st.checkbox("Optimal angles", key="ui_optimalangles")
+        angle = st.number_input("Tilt [°]", min_value=0.0, max_value=90.0, step=1.0, key="ui_angle")
+        aspect = st.number_input("Azimut [°]", min_value=-180.0, max_value=180.0, step=1.0, key="ui_aspect")
+    with a3:
+        tracking_options = ["fixed", "trackingtype_horizontal", "trackingtype_tilted", "trackingtype_biaxial"]
+        if st.session_state["ui_tracking_mode"] not in tracking_options:
+            st.session_state["ui_tracking_mode"] = "fixed"
+        tracking_mode = st.selectbox("Tracking", tracking_options, key="ui_tracking_mode")
+
+        raddb_options = ["PVGIS-SARAH3", "PVGIS-ERA5", "PVGIS-SARAH2"]
+        if st.session_state["ui_raddatabase"] not in raddb_options:
+            st.session_state["ui_raddatabase"] = "PVGIS-SARAH3"
+        raddatabase = st.selectbox("Radiation database PVGIS", raddb_options, key="ui_raddatabase")
+
+        min_year, max_year = get_db_year_limits(raddatabase)
+        if st.session_state["ui_startyear"] < min_year or st.session_state["ui_startyear"] > max_year:
+            st.session_state["ui_startyear"] = min_year
+        if st.session_state["ui_endyear"] < min_year or st.session_state["ui_endyear"] > max_year:
+            st.session_state["ui_endyear"] = max_year
+
+        startyear = st.number_input(
+            "Anno iniziale baseline",
+            min_value=min_year,
+            max_value=max_year,
+            step=1,
+            key="ui_startyear",
+        )
+        endyear = st.number_input(
+            "Anno finale baseline",
+            min_value=min_year,
+            max_value=max_year,
+            step=1,
+            key="ui_endyear",
+        )
+        usehorizon = st.checkbox("Use horizon", key="ui_usehorizon")
+        components = st.checkbox("Radiation components", key="ui_components")
+
+    st.markdown("### B. Baseline storica")
+    percentile = st.selectbox("Percentile baseline", [10, 50], key="ui_percentile")
+
+    st.markdown("### C. Meteo reale recente")
+    source_name = st.selectbox("Fonte meteo recente", ["Open-Meteo", "NASA POWER"], key="weather_source")
+
+    r1, r2 = st.columns(2)
+    with r1:
+        recent_start_date = st.date_input("Data iniziale meteo recente", key="ui_recent_start_date")
+    with r2:
+        recent_end_date = st.date_input("Data finale meteo recente", key="ui_recent_end_date")
+
+    if source_name == "Open-Meteo":
+        open_meteo_hourly_variables = st.multiselect(
+            "Misure orarie da scaricare",
+            options=list(OPEN_METEO_VARIABLE_LABELS.keys()),
+            default=st.session_state.get("open_meteo_vars", OPEN_METEO_RECOMMENDED_DEFAULT),
+            format_func=lambda x: f"{x} — {OPEN_METEO_VARIABLE_LABELS.get(x, x)}",
+            key="open_meteo_vars",
+            help="Per il calcolo produzione tieni almeno global_tilted_irradiance e temperature_2m.",
+        )
+        nasa_parameters = []
+    else:
+        nasa_parameters = st.multiselect(
+            "Misure orarie da scaricare",
+            options=list(NASA_PARAMETER_LABELS.keys()),
+            default=st.session_state.get(
+                "nasa_power_vars",
+                ["ALLSKY_SFC_SW_DWN", "T2M", "WS10M", "ALLSKY_SFC_SW_DNI", "ALLSKY_SFC_SW_DIFF"],
+            ),
+            format_func=lambda x: f"{x} — {NASA_PARAMETER_LABELS.get(x, x)}",
+            key="nasa_power_vars",
+            help="Per il calcolo produzione tieni almeno ALLSKY_SFC_SW_DWN e T2M.",
+        )
+        open_meteo_hourly_variables = []
+
+    # ---------------------------------------------------------
+    # D. Upload file DOPO le sezioni manuali
+    # ---------------------------------------------------------
+    st.markdown("### D. File impianto / misure opzionale")
     uploaded_plant_file = st.file_uploader(
         "Carica file impianto Excel (.xlsx/.xls) con foglio configurazione e foglio misure opzionale",
         type=["xlsx", "xls"],
         key="plant_workbook_uploader",
+        help=(
+            "Il file è opzionale. Se presente, aggiorna i valori delle sezioni sopra e abilita il confronto con le misure. "
+            "Se assente, l'elaborazione usa solo i dati inseriti manualmente e non confronta il misurato."
+        ),
     )
 
     parsed_workbook = None
-    prefill = {}
     measurements_from_file = None
     config_raw_sheet = None
     measurements_raw_sheet = None
+    measurements_diagnostics = {}
 
     if uploaded_plant_file is not None:
         try:
             parsed_workbook = load_plant_workbook(uploaded_plant_file)
-            prefill = parsed_workbook["plant_cfg"]
             measurements_from_file = parsed_workbook["measurements_df"]
             config_raw_sheet = parsed_workbook["config_raw_df"]
             measurements_raw_sheet = parsed_workbook["measurements_raw_df"]
+            measurements_diagnostics = parsed_workbook.get("measurements_diagnostics", {})
+
+            upload_token = f"{uploaded_plant_file.name}_{uploaded_plant_file.size}"
+            if st.session_state.get("last_prefill_upload_token") != upload_token:
+                cfg = parsed_workbook["plant_cfg"]
+                pending = {
+                    "ui_codice_impianto": str(cfg.get("codice_impianto", "SRB_xxx")),
+                    "ui_lat": float(cfg.get("lat", 41.8927524)),
+                    "ui_lon": float(cfg.get("lon", 12.4853054)),
+                    "ui_peakpower": float(cfg.get("peakpower", 1.0)),
+                    "ui_loss": float(cfg.get("loss", 14.0)),
+                    "ui_pvtechchoice": str(cfg.get("pvtechchoice", "crystSi")),
+                    "ui_mountingplace": str(cfg.get("mountingplace", "free")),
+                    "ui_optimalangles": bool(cfg.get("optimalangles", False)),
+                    "ui_angle": float(cfg.get("angle", 30.0)),
+                    "ui_aspect": float(cfg.get("aspect", 0.0)),
+                    "ui_tracking_mode": str(cfg.get("tracking_mode", "fixed")),
+                    "ui_raddatabase": str(cfg.get("raddatabase", "PVGIS-SARAH3")),
+                    "ui_startyear": int(cfg.get("startyear", 2005)),
+                    "ui_endyear": int(cfg.get("endyear", 2023)),
+                    "ui_usehorizon": bool(cfg.get("usehorizon", True)),
+                    "ui_components": bool(cfg.get("components", True)),
+                }
+
+                # Se ci sono misure, aggiorna anche le date meteo in UI usando min/max misure.
+                if measurements_from_file is not None and not measurements_from_file.empty:
+                    ts = measurements_from_file["timestamp_utc"]
+                    pending["ui_recent_start_date"] = ts.min().date()
+                    pending["ui_recent_end_date"] = ts.max().date()
+
+                st.session_state["pending_ui_defaults"] = pending
+                st.session_state["last_prefill_upload_token"] = upload_token
+                st.rerun()
 
             st.success(
                 f"File caricato correttamente. Foglio configurazione: {parsed_workbook['config_sheet_name']}. "
@@ -1248,132 +1397,29 @@ def app_ui() -> None:
                     else "Foglio misure non presente: verrà eseguito solo il confronto atteso vs baseline."
                 )
             )
+            st.info("I valori delle sezioni sopra sono stati aggiornati dal file. Puoi modificarli manualmente prima di avviare.")
 
             if measurements_from_file is not None:
                 st.caption(
                     f"Misure trovate: {len(measurements_from_file)} righe orarie dopo il riempimento dei buchi con zero."
                 )
-                local_start, local_end = get_measurement_local_date_range(measurements_from_file)
-                if local_start and local_end:
-                    st.info(
-                        f"Date meteo sincronizzate con il file misure in ora locale {LOCAL_TIMEZONE}: "
-                        f"dal {local_start.isoformat()} al {local_end.isoformat()}."
-                    )
+                if measurements_diagnostics:
+                    with st.expander("Diagnostica misure caricate", expanded=False):
+                        st.dataframe(pd.DataFrame([measurements_diagnostics]), use_container_width=True)
         except Exception as exc:
             st.error(f"Errore nel file impianto: {exc}")
-            return
+            parsed_workbook = None
+            measurements_from_file = None
+            config_raw_sheet = None
+            measurements_raw_sheet = None
+            measurements_diagnostics = {}
     else:
-        st.warning("Il file impianto con foglio configurazione è obbligatorio.")
-        return
+        st.info(
+            "Nessun file caricato: l'elaborazione userà i dati inseriti nelle sezioni sopra e non farà il confronto con le misure."
+        )
 
-    measurement_start_date, measurement_end_date = get_measurement_local_date_range(measurements_from_file)
-    meteo_default_start = measurement_start_date or default_recent_start
-    meteo_default_end = measurement_end_date or today_minus_7
-
-    default_token = None
-    if uploaded_plant_file is not None:
-        default_token = f"{uploaded_plant_file.name}_{uploaded_plant_file.size}"
-
-    # Sincronizza anche i widget visibili nella sezione D quando viene caricato/cambiato file.
-    sync_token = f"{default_token}_{measurement_start_date}_{measurement_end_date}"
-    if st.session_state.get("last_measurement_date_sync_token") != sync_token:
-        st.session_state["recent_start_date"] = meteo_default_start
-        st.session_state["recent_end_date"] = meteo_default_end
-        st.session_state["last_measurement_date_sync_token"] = sync_token
-
-    with st.form("verification_form"):
-        st.markdown("### B. Configurazione impianto")
-        a1, a2, a3 = st.columns(3)
-        with a1:
-            codice_impianto = st.text_input("Codice impianto", value=str(prefill.get("codice_impianto", "SRB_xxx")))
-            lat = st.number_input("Latitudine", value=float(prefill.get("lat", 41.8927524)), format="%.7f")
-            lon = st.number_input("Longitudine", value=float(prefill.get("lon", 12.4853054)), format="%.7f")
-            peakpower = st.number_input("Peak power [kWp]", min_value=0.0, value=float(prefill.get("peakpower", 1.0)), step=0.1)
-            loss = st.number_input("Loss [%]", min_value=0.0, max_value=100.0, value=float(prefill.get("loss", 14.0)), step=0.5)
-        with a2:
-            pvtech_options = ["crystSi", "CIS", "CdTe", "Unknown"]
-            pvtech_default = prefill.get("pvtechchoice", "crystSi")
-            pvtech_idx = pvtech_options.index(pvtech_default) if pvtech_default in pvtech_options else 0
-            pvtechchoice = st.selectbox("Tecnologia pannello", pvtech_options, index=pvtech_idx)
-
-            mounting_options = ["free", "building"]
-            mounting_default = prefill.get("mountingplace", "free")
-            mounting_idx = mounting_options.index(mounting_default) if mounting_default in mounting_options else 0
-            mountingplace = st.selectbox("Tipo di montaggio", mounting_options, index=mounting_idx)
-
-            optimalangles = st.checkbox("Optimal angles", value=bool(prefill.get("optimalangles", False)))
-            angle = st.number_input("Tilt [°]", min_value=0.0, max_value=90.0, value=float(prefill.get("angle", 30.0)), step=1.0)
-            aspect = st.number_input("Azimut [°]", min_value=-180.0, max_value=180.0, value=float(prefill.get("aspect", 0.0)), step=1.0)
-        with a3:
-            tracking_options = ["fixed", "trackingtype_horizontal", "trackingtype_tilted", "trackingtype_biaxial"]
-            tracking_default = prefill.get("tracking_mode", "fixed")
-            tracking_idx = tracking_options.index(tracking_default) if tracking_default in tracking_options else 0
-            tracking_mode = st.selectbox("Tracking", tracking_options, index=tracking_idx)
-
-            raddb_options = ["PVGIS-SARAH3", "PVGIS-ERA5", "PVGIS-SARAH2"]
-            raddb_default = prefill.get("raddatabase", "PVGIS-SARAH3")
-            raddb_idx = raddb_options.index(raddb_default) if raddb_default in raddb_options else 0
-            raddatabase = st.selectbox("Radiation database PVGIS", raddb_options, index=raddb_idx)
-
-            min_year, max_year = get_db_year_limits(raddatabase)
-            startyear = st.number_input(
-                "Anno iniziale baseline",
-                min_value=min_year,
-                max_value=max_year,
-                value=min(max(int(prefill.get("startyear", min_year)), min_year), max_year),
-                step=1,
-            )
-            endyear = st.number_input(
-                "Anno finale baseline",
-                min_value=min_year,
-                max_value=max_year,
-                value=min(max(int(prefill.get("endyear", max_year)), min_year), max_year),
-                step=1,
-            )
-            usehorizon = st.checkbox("Use horizon", value=bool(prefill.get("usehorizon", True)))
-            components = st.checkbox("Radiation components", value=bool(prefill.get("components", True)))
-
-        st.markdown("### C. Baseline storica")
-        percentile = st.selectbox("Percentile baseline", [10, 50], index=1)
-
-        st.markdown("### D. Meteo reale recente")
-        source_name = st.selectbox("Fonte meteo recente", ["Open-Meteo", "NASA POWER"], index=0, key="weather_source")
-
-        r1, r2 = st.columns(2)
-        with r1:
-            recent_start_date = st.date_input("Data iniziale meteo recente", value=meteo_default_start, key="recent_start_date")
-        with r2:
-            recent_end_date = st.date_input("Data finale meteo recente", value=meteo_default_end, key="recent_end_date")
-
-        if source_name == "Open-Meteo":
-            open_meteo_hourly_variables = st.multiselect(
-                "Misure orarie da scaricare",
-                options=list(OPEN_METEO_VARIABLE_LABELS.keys()),
-                default=OPEN_METEO_RECOMMENDED_DEFAULT,
-                format_func=lambda x: f"{x} — {OPEN_METEO_VARIABLE_LABELS.get(x, x)}",
-                key="open_meteo_vars",
-                help="Per il calcolo produzione tieni almeno global_tilted_irradiance e temperature_2m.",
-            )
-            nasa_parameters = []
-        else:
-            nasa_parameters = st.multiselect(
-                "Misure orarie da scaricare",
-                options=list(NASA_PARAMETER_LABELS.keys()),
-                default=["ALLSKY_SFC_SW_DWN", "T2M", "WS10M", "ALLSKY_SFC_SW_DNI", "ALLSKY_SFC_SW_DIFF"],
-                format_func=lambda x: f"{x} — {NASA_PARAMETER_LABELS.get(x, x)}",
-                key="nasa_power_vars",
-                help="Per il calcolo produzione tieni almeno ALLSKY_SFC_SW_DWN e T2M.",
-            )
-            open_meteo_hourly_variables = []
-
-        submit = st.form_submit_button("Esegui verifica e genera output")
-
-    auto_submit = False
-    if default_token is not None and st.session_state.get("last_autorun_upload_token") != default_token:
-        auto_submit = True
-        st.session_state["last_autorun_upload_token"] = default_token
-
-    if not submit and not auto_submit:
+    submit = st.button("Esegui verifica e genera output", type="primary")
+    if not submit:
         return
 
     try:
@@ -1394,12 +1440,9 @@ def app_ui() -> None:
             "components": bool(components),
         }
         baseline_cfg = {"startyear": int(startyear), "endyear": int(endyear), "percentile": int(percentile)}
-        # Queste sono le stesse date mostrate nei widget della sezione D.
-        # Se il foglio misure è presente, sono sincronizzate con min/max locali del file.
         recent_cfg = {
             "start_date": recent_start_date,
             "end_date": recent_end_date,
-            "local_timezone": LOCAL_TIMEZONE,
             "nasa_parameters": nasa_parameters,
             "open_meteo_hourly_variables": open_meteo_hourly_variables,
         }
@@ -1462,19 +1505,26 @@ def app_ui() -> None:
         progress.progress(65, text="Produzione attesa calcolata")
 
         status.info("4/5 - Preparo misure da file impianto")
-        monitoring_prepared = measurements_from_file
-        monitoring_raw = measurements_raw_sheet
+        monitoring_prepared = measurements_from_file if uploaded_plant_file is not None else None
+        monitoring_raw = measurements_raw_sheet if uploaded_plant_file is not None else None
         if monitoring_prepared is None:
-            st.info("Foglio misure assente: verrà prodotto solo il confronto tra atteso e baseline.")
+            st.info("Nessuna misura disponibile: verrà prodotto solo il confronto tra atteso e baseline.")
         progress.progress(82, text="Misure preparate")
 
         status.info("5/5 - Costruisco confronto, KPI ed Excel")
         comparison_df = compare_expected_vs_measured(expected_recent, monitoring_prepared, baseline_percentile)
         kpi_df = summarize_kpis(comparison_df, source_name, int(percentile))
 
+        diagnostics_rows = []
+        if measurements_diagnostics:
+            diagnostics_rows = [
+                {"section": "measurement_diagnostics", "key": k, "value": v}
+                for k, v in measurements_diagnostics.items()
+            ]
+
         config_rows = [
             {"section": "plant", "key": k, "value": v} for k, v in plant_cfg.items()
-        ] + [
+        ] + diagnostics_rows + [
             {"section": "baseline", "key": k, "value": v} for k, v in baseline_cfg.items()
         ] + [
             {"section": "recent_weather", "key": k, "value": v.isoformat() if hasattr(v, "isoformat") else v}
@@ -1483,6 +1533,7 @@ def app_ui() -> None:
             {"section": "run", "key": "generated_at_utc", "value": datetime.utcnow().isoformat()},
             {"section": "run", "key": "user", "value": user["username"]},
             {"section": "run", "key": "weather_source", "value": source_name},
+            {"section": "run", "key": "uploaded_file_present", "value": uploaded_plant_file is not None},
             {"section": "run", "key": "measurements_present", "value": monitoring_prepared is not None},
             {
                 "section": "run",
@@ -1514,7 +1565,6 @@ def app_ui() -> None:
         st.subheader("Prime righe del confronto")
         view_cols = [
             c for c in [
-                "timestamp_local",
                 "timestamp_utc",
                 "expected_energy_kwh",
                 "baseline_energy_kwh",
@@ -1536,8 +1586,7 @@ def app_ui() -> None:
         chart_df = comparison_df.copy().sort_values("timestamp_utc")
         chart_cols = [c for c in ["expected_energy_kwh", "baseline_energy_kwh", "measured_energy_kwh"] if c in chart_df.columns]
         if chart_cols:
-            chart_time_col = "timestamp_local" if "timestamp_local" in chart_df.columns else "timestamp_utc"
-            line_df = chart_df[[chart_time_col] + chart_cols].set_index(chart_time_col)
+            line_df = chart_df[["timestamp_utc"] + chart_cols].set_index("timestamp_utc")
             st.line_chart(line_df, height=360)
         else:
             st.info("Non ci sono abbastanza dati per il grafico orario.")
@@ -1564,7 +1613,7 @@ def app_ui() -> None:
             st.write(
                 "Open-Meteo usa GTI oraria se disponibile; NASA POWER usa GHI come proxy semplice dell'irraggiamento sul piano. "
                 "La baseline PVGIS viene convertita da P [W] a baseline_energy_kwh su base oraria dividendo per 1000. "
-                "Le misure del file impianto sono lette come Potenza misurata [kW] oraria in ora locale Europe/Rome: i buchi dell'intervallo vengono riempiti con zero e i timestamp sono poi convertiti in UTC per l'allineamento. "
+                "Le misure del file impianto sono lette come Potenza misurata [kW] oraria: i buchi dell'intervallo vengono riempiti con zero. "
                 "Per il confronto orario, kW medi orari e kWh dell'ora vengono assunti numericamente equivalenti."
             )
     except requests.HTTPError as exc:
@@ -1572,7 +1621,6 @@ def app_ui() -> None:
         st.error(f"Errore HTTP dalle API: {body}")
     except Exception as exc:
         st.error(f"Errore: {exc}")
-
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -1585,3 +1633,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
