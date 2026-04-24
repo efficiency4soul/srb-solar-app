@@ -1,4 +1,3 @@
-
 import os
 import sqlite3
 import smtplib
@@ -16,7 +15,7 @@ import requests
 import streamlit as st
 
 APP_TITLE = "Tower PV Analytics"
-APP_SUBTITLE = "Solar Performance Intelligence for Telecom Towers"
+APP_SUBTITLE = "Solar Performance Insights for Telecom Towers"
 DB_PATH = "users.db"
 RUNS_DIR = "runs"
 REQUEST_TIMEOUT = 90
@@ -416,77 +415,8 @@ MEASURE_ALIASES = {
     "month": ["mese", "month"],
     "day": ["giorno", "day"],
     "hour": ["ora", "hour"],
-    "power_kw": [
-        "potenza_misurata_kw",
-        "potenza misurata kw",
-        "potenza_misurata",
-        "potenza misurata",
-        "potenza_kw",
-        "power_kw",
-        "power",
-        "kw",
-        "potenza",
-    ],
+    "power_kw": ["potenza_misurata_kw", "potenza_kw", "power_kw", "kw", "potenza"],
 }
-
-
-def find_header_row(
-    xls: pd.ExcelFile,
-    sheet_name: str,
-    aliases_dict: Dict[str, List[str]],
-    min_found: int = 4,
-    max_rows: int = 50,
-) -> Optional[int]:
-    """Trova la riga di intestazione anche se sopra ci sono titoli, note o righe vuote."""
-    preview = pd.read_excel(
-        xls,
-        sheet_name=sheet_name,
-        header=None,
-        nrows=max_rows,
-    )
-
-    alias_groups = list(aliases_dict.values())
-
-    for row_idx in range(len(preview)):
-        row_values = [
-            normalize_text(v)
-            for v in preview.iloc[row_idx].tolist()
-            if not pd.isna(v)
-        ]
-
-        found = 0
-        for aliases in alias_groups:
-            aliases_norm = [normalize_text(a) for a in aliases]
-            if any(alias in row_values for alias in aliases_norm):
-                found += 1
-
-        if found >= min_found:
-            return row_idx
-
-    return None
-
-
-def read_excel_with_detected_header(
-    xls: pd.ExcelFile,
-    sheet_name: str,
-    aliases_dict: Dict[str, List[str]],
-    min_found: int = 4,
-) -> pd.DataFrame:
-    header_row = find_header_row(
-        xls=xls,
-        sheet_name=sheet_name,
-        aliases_dict=aliases_dict,
-        min_found=min_found,
-    )
-
-    if header_row is None:
-        df = pd.read_excel(xls, sheet_name=sheet_name)
-    else:
-        df = pd.read_excel(xls, sheet_name=sheet_name, header=header_row)
-
-    df = df.dropna(how="all").copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
 
 
 def detect_sheet_roles(xls: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]:
@@ -494,17 +424,19 @@ def detect_sheet_roles(xls: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]
     measure_sheet = None
 
     for sheet in xls.sheet_names:
-        sheet_name_norm = normalize_text(sheet)
+        sample = pd.read_excel(xls, sheet_name=sheet, nrows=20)
+        cols_norm = [normalize_text(c) for c in sample.columns]
 
-        # Cerca le intestazioni delle misure dentro le prime righe, non solo nella prima riga del foglio.
-        measure_header_row = find_header_row(
-            xls=xls,
-            sheet_name=sheet,
-            aliases_dict=MEASURE_ALIASES,
-            min_found=4,
+        has_measure_cols = (
+            any(c in cols_norm for c in ["anno", "year"])
+            and any(c in cols_norm for c in ["mese", "month"])
+            and any(c in cols_norm for c in ["giorno", "day"])
+            and any(c in cols_norm for c in ["ora", "hour"])
         )
 
-        if measure_header_row is not None and measure_sheet is None:
+        sheet_name_norm = normalize_text(sheet)
+
+        if has_measure_cols and measure_sheet is None:
             measure_sheet = sheet
 
         if config_sheet is None:
@@ -512,12 +444,14 @@ def detect_sheet_roles(xls: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]
                 config_sheet = sheet
 
     if config_sheet is None:
+        # fallback: il primo foglio che non sia misure
         for sheet in xls.sheet_names:
             if sheet != measure_sheet:
                 config_sheet = sheet
                 break
 
     return config_sheet, measure_sheet
+
 
 def dataframe_to_key_value(df: pd.DataFrame) -> Dict[str, object]:
     out = {}
@@ -680,13 +614,8 @@ def load_plant_workbook(uploaded_file) -> Dict:
     measurements_df = None
     measurements_raw = None
     if measure_sheet is not None:
-        measurements_raw = read_excel_with_detected_header(
-            xls=xls,
-            sheet_name=measure_sheet,
-            aliases_dict=MEASURE_ALIASES,
-            min_found=4,
-        )
-        if measurements_raw is not None and not measurements_raw.empty:
+        measurements_raw = pd.read_excel(xls, sheet_name=measure_sheet)
+        if not measurements_raw.empty:
             measurements_df = prepare_measurements_from_sheet(measurements_raw)
 
     return {
@@ -1009,17 +938,21 @@ def inject_tpa_style() -> None:
         """
         <style>
         .block-container {padding-top: 1.4rem; padding-bottom: 2rem;}
-        .tpa-hero {padding: 1.25rem 1.4rem; border-radius: 18px; background: linear-gradient(135deg, #0f172a 0%, #164e63 55%, #166534 100%); color: white; margin-bottom: 1rem; box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);}
+        :root {--tpa-red:#9B1C1F; --tpa-red-dark:#761114; --tpa-green:#6BAA35; --tpa-ink:#1F2933; --tpa-muted:#5F6B7A; --tpa-soft:#F7F8F4;}
+        .tpa-hero {padding: 1.25rem 1.4rem; border-radius: 18px; background: linear-gradient(135deg, #761114 0%, #9B1C1F 48%, #6BAA35 100%); color: white; margin-bottom: 1rem; box-shadow: 0 10px 28px rgba(118, 17, 20, 0.18);}
         .tpa-hero h1 {margin: 0; font-size: 2.05rem; letter-spacing: -0.02em;}
-        .tpa-hero p {margin: .35rem 0 0 0; color: rgba(255,255,255,.86); font-size: 1.02rem;}
-        .tpa-card {padding: 1rem 1.1rem; border: 1px solid rgba(148, 163, 184, .35); border-radius: 16px; background: rgba(255, 255, 255, .72); box-shadow: 0 4px 18px rgba(15, 23, 42, .06); min-height: 120px;}
-        .tpa-card h4 {margin: 0 0 .35rem 0; font-size: 1rem;}
-        .tpa-card p {margin: 0; color: #475569; font-size: .92rem;}
-        .tpa-kpi {padding: .9rem 1rem; border: 1px solid rgba(148, 163, 184, .35); border-radius: 16px; background: white; box-shadow: 0 4px 14px rgba(15, 23, 42, .05);}
-        .tpa-kpi-label {font-size: .82rem; color: #64748b; margin-bottom: .25rem;}
-        .tpa-kpi-value {font-size: 1.55rem; font-weight: 700; color: #0f172a;}
-        .tpa-kpi-note {font-size: .78rem; color: #64748b; margin-top: .18rem;}
-        .tpa-section-caption {color: #64748b; margin-top: -0.35rem; margin-bottom: .7rem;}
+        .tpa-hero p {margin: .35rem 0 0 0; color: rgba(255,255,255,.88); font-size: 1.02rem;}
+        .tpa-card {padding: 1rem 1.1rem; border: 1px solid rgba(155, 28, 31, .16); border-left: 4px solid #9B1C1F; border-radius: 16px; background: #FFFFFF; box-shadow: 0 4px 18px rgba(31, 41, 51, .06); min-height: 120px;}
+        .tpa-card h4 {margin: 0 0 .35rem 0; font-size: 1rem; color:#761114;}
+        .tpa-card p {margin: 0; color: #5F6B7A; font-size: .92rem;}
+        .tpa-kpi {padding: .9rem 1rem; border: 1px solid rgba(155, 28, 31, .15); border-radius: 16px; background: white; box-shadow: 0 4px 14px rgba(31, 41, 51, .05);}
+        .tpa-kpi-label {font-size: .82rem; color: #5F6B7A; margin-bottom: .25rem;}
+        .tpa-kpi-value {font-size: 1.55rem; font-weight: 700; color: #761114;}
+        .tpa-kpi-note {font-size: .78rem; color: #5F6B7A; margin-top: .18rem;}
+        .tpa-section-caption {color: #5F6B7A; margin-top: -0.35rem; margin-bottom: .7rem;}
+        .tpa-admin-spacer {height: 1.35rem;}
+        div.stButton > button[kind="primary"] {background-color:#9B1C1F; border-color:#9B1C1F;}
+        div.stButton > button[kind="primary"]:hover {background-color:#761114; border-color:#761114;}
         </style>
         """, unsafe_allow_html=True)
 
@@ -1255,13 +1188,14 @@ def app_ui() -> None:
 
     top_left, top_right = st.columns([5, 1])
     with top_left:
-        st.caption("Analisi delle prestazioni fotovoltaiche per siti tower e infrastrutture telecom.")
+        st.caption("Analisi delle prestazioni fotovoltaiche per siti con impianti FV.")
     with top_right:
         if st.button("Logout", use_container_width=True):
             st.session_state.clear()
             st.rerun()
 
     render_structure()
+    st.markdown("<div class='tpa-admin-spacer'></div>", unsafe_allow_html=True)
 
     if int(user["is_admin"]) == 1:
         with st.expander("Amministrazione Utenti", expanded=False):
@@ -1381,9 +1315,7 @@ def app_ui() -> None:
 
     st.markdown("### 5. Avvio Analisi")
     st.caption("Se il file misure è presente verrà eseguito il confronto Reale vs Atteso. In assenza di misure verrà generata una simulazione Atteso vs Baseline.")
-    btn_col, _ = st.columns([1, 3])
-    with btn_col:
-        submit = st.button("Avvia Analisi Prestazioni", type="primary", use_container_width=False)
+    submit = st.button("Avvia Analisi Prestazioni", type="primary", use_container_width=True)
     if not submit:
         return
 
