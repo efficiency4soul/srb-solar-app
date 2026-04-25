@@ -1285,19 +1285,13 @@ def app_ui() -> None:
     user = st.session_state["user"]
     render_hero(user)
 
-    top_left, top_actions = st.columns([4, 2])
+    top_left, top_actions = st.columns([5, 1])
     with top_left:
         st.caption("Analisi delle prestazioni fotovoltaiche per siti con impianti FV.")
     with top_actions:
-        action_cols = st.columns(2)
-        with action_cols[0]:
-            if st.button("Nuova richiesta", use_container_width=True, key="btn_nuova_richiesta"):
-                reset_analysis_session()
-                st.rerun()
-        with action_cols[1]:
-            if st.button("Logout", use_container_width=True, key="btn_logout"):
-                st.session_state.clear()
-                st.rerun()
+        if st.button("Logout", use_container_width=True, key="btn_logout"):
+            st.session_state.clear()
+            st.rerun()
 
     render_structure()
     st.markdown("<div class='tpa-admin-spacer'></div>", unsafe_allow_html=True)
@@ -1414,14 +1408,24 @@ def app_ui() -> None:
     st.markdown("### 5. Avvio Analisi")
     st.caption("Se il file misure è presente verrà eseguito il confronto Reale vs Atteso. In assenza di misure verrà generata una simulazione Atteso vs Baseline.")
 
-    btn_col, _ = st.columns([1, 4])
-    with btn_col:
+    btn_start_col, btn_reset_col, _ = st.columns([1.25, 1.05, 3.7])
+    with btn_start_col:
         submit = st.button(
             "Avvia Analisi Prestazioni",
             type="primary",
             use_container_width=True,
             key="btn_avvia_analisi_prestazioni",
         )
+    with btn_reset_col:
+        new_request = st.button(
+            "Nuova richiesta",
+            use_container_width=True,
+            key="btn_nuova_richiesta_footer",
+        )
+
+    if new_request:
+        reset_analysis_session()
+        st.rerun()
 
     if not submit:
         return
@@ -1442,9 +1446,6 @@ def app_ui() -> None:
             nasa_cfg = {"parameters": recent_cfg["nasa_parameters"], "start_date": recent_cfg["start_date"], "end_date": recent_cfg["end_date"]}
             meteo_request_params = build_nasa_params(nasa_cfg, plant_cfg["lat"], plant_cfg["lon"])
             meteo_request_line = render_request_line(NASA_BASE_URL, meteo_request_params)
-        with st.expander("Traccia chiamate API", expanded=False):
-            trace_text = "Chiamata PVGIS\n" + f"{render_request_line(PVGIS_BASE_URL, build_pvgis_params(pvgis_cfg))}\n\n" + f"Fonte recente: {source_name}\n" + f"{meteo_request_line}"
-            st.code(trace_text, language=None)
         status.info("1/5 - Scarico baseline PVGIS")
         baseline_raw = fetch_pvgis_hourly(pvgis_cfg)
         baseline_percentile = aggregate_pvgis_baseline(baseline_raw, percentile=baseline_cfg["percentile"], plant_code=plant_cfg["codice_impianto"])
@@ -1475,20 +1476,42 @@ def app_ui() -> None:
         measurements_present = monitoring_prepared is not None and not monitoring_prepared.empty
         st.markdown("## Risultati Analisi Prestazioni Impianto")
         st.markdown("### Sintesi Prestazioni Impianto")
-        k1, k2, k3, k4 = st.columns(4)
+
         if measurements_present:
-            with k1: render_kpi_card("Energia Misurata", fmt_num(metric_value(kpi_df, "measured_energy_total_kwh"), 1, " kWh"), "Produzione rilevata")
-            with k2: render_kpi_card("Energia Attesa", fmt_num(metric_value(kpi_df, "expected_energy_total_kwh"), 1, " kWh"), "Stima meteo reale")
-            with k3: render_kpi_card("Scostamento Medio", fmt_num(metric_value(kpi_df, "mean_deviation_pct"), 1, "%"), "Misurato vs atteso")
-            with k4: render_kpi_card("Indice Prestazione", fmt_num(metric_value(kpi_df, "mean_performance_ratio_proxy"), 2, ""), "Target ≈ 1")
+            kpi_table = pd.DataFrame([
+                {"Indicatore": "Energia Misurata", "Valore": fmt_num(metric_value(kpi_df, "measured_energy_total_kwh"), 1, " kWh")},
+                {"Indicatore": "Energia Attesa", "Valore": fmt_num(metric_value(kpi_df, "expected_energy_total_kwh"), 1, " kWh")},
+                {"Indicatore": "Scostamento Medio", "Valore": fmt_num(metric_value(kpi_df, "mean_deviation_pct"), 1, "%")},
+                {"Indicatore": "Indice Prestazione", "Valore": fmt_num(metric_value(kpi_df, "mean_performance_ratio_proxy"), 2, "")},
+            ])
+            kpi_notes = pd.DataFrame([
+                {"Indicatore": "Energia Misurata", "Descrizione e formula": "Somma dell'energia misurata nel periodo. Formula: Σ Energia Misurata Oraria [kWh]."},
+                {"Indicatore": "Energia Attesa", "Descrizione e formula": "Produzione stimata con dati meteo reali e parametri impianto. Formula: Σ Energia Attesa Oraria [kWh]."},
+                {"Indicatore": "Scostamento Medio", "Descrizione e formula": "Media degli scostamenti percentuali orari. Formula: media((Misurata - Attesa) / Attesa × 100)."},
+                {"Indicatore": "Indice Prestazione", "Descrizione e formula": "Rapporto medio tra produzione misurata e attesa. Formula: media(Misurata / Attesa). Valori vicini a 1 indicano prestazioni in linea."},
+            ])
         else:
-            with k1: render_kpi_card("Energia Attesa", fmt_num(metric_value(kpi_df, "expected_energy_total_kwh"), 1, " kWh"), "Stima meteo reale")
-            with k2: render_kpi_card("Baseline Storica", fmt_num(metric_value(kpi_df, "baseline_energy_total_kwh"), 1, " kWh"), "PVGIS percentile")
-            with k3: render_kpi_card("Delta vs Baseline", fmt_num(metric_value(kpi_df, "mean_delta_expected_vs_baseline_pct"), 1, "%"), "Atteso recente vs storico")
-            with k4: render_kpi_card("Ore Analizzate", fmt_num(metric_value(kpi_df, "rows_comparison"), 0, ""), "Periodo selezionato")
+            kpi_table = pd.DataFrame([
+                {"Indicatore": "Energia Attesa", "Valore": fmt_num(metric_value(kpi_df, "expected_energy_total_kwh"), 1, " kWh")},
+                {"Indicatore": "Baseline Storica", "Valore": fmt_num(metric_value(kpi_df, "baseline_energy_total_kwh"), 1, " kWh")},
+                {"Indicatore": "Delta vs Baseline", "Valore": fmt_num(metric_value(kpi_df, "mean_delta_expected_vs_baseline_pct"), 1, "%")},
+                {"Indicatore": "Ore Analizzate", "Valore": fmt_num(metric_value(kpi_df, "rows_comparison"), 0, "")},
+            ])
+            kpi_notes = pd.DataFrame([
+                {"Indicatore": "Energia Attesa", "Descrizione e formula": "Produzione stimata con dati meteo reali e parametri impianto. Formula: Σ Energia Attesa Oraria [kWh]."},
+                {"Indicatore": "Baseline Storica", "Descrizione e formula": "Produzione storica attesa da PVGIS sul percentile selezionato. Formula: Σ Baseline Oraria [kWh]."},
+                {"Indicatore": "Delta vs Baseline", "Descrizione e formula": "Differenza media tra produzione attesa recente e baseline storica. Formula: media((Attesa - Baseline) / Baseline × 100)."},
+                {"Indicatore": "Ore Analizzate", "Descrizione e formula": "Numero di ore presenti nel periodo di analisi. Formula: conteggio righe orarie del confronto."},
+            ])
+
+        kpi_left, kpi_right = st.columns([1.0, 1.35])
+        with kpi_left:
+            st.dataframe(kpi_table, use_container_width=True, hide_index=True)
+        with kpi_right:
+            st.dataframe(kpi_notes, use_container_width=True, hide_index=True, height=210)
+
         st.markdown("<div class='tpa-small-spacer'></div>", unsafe_allow_html=True)
-        render_kpi_legend(measurements_present)
-        with st.expander("Tabella indicatori tecnici", expanded=measurements_present):
+        with st.expander("Tabella indicatori tecnici", expanded=False):
             st.dataframe(kpi_df, use_container_width=True)
         st.markdown("### Produzione Oraria: Misurata vs Attesa vs Baseline")
         chart_df = comparison_df.copy().sort_values("timestamp_utc")
@@ -1528,3 +1551,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
