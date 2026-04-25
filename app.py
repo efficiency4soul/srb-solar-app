@@ -411,40 +411,107 @@ CONFIG_ALIASES = {
 }
 
 MEASURE_ALIASES = {
-    "year": ["anno", "year"],
-    "month": ["mese", "month"],
-    "day": ["giorno", "day"],
-    "hour": ["ora", "hour"],
-    "power_kw": ["potenza_misurata_kw", "potenza_kw", "power_kw", "kw", "potenza"],
+    "year": ["anno", "year", "aa"],
+    "month": ["mese", "month", "mm"],
+    "day": ["giorno", "day", "gg"],
+    "hour": ["ora", "hour", "hh", "h"],
+    "power_kw": [
+        "potenza_misurata_kw",
+        "potenza misurata kw",
+        "potenza_misurata_kwh",
+        "potenza_misurata",
+        "potenza_kw",
+        "power_kw",
+        "power",
+        "kw",
+        "potenza",
+        "produzione",
+        "produzione_kw",
+    ],
 }
+
+
+def find_measure_header_row(
+    xls: pd.ExcelFile,
+    sheet_name: str,
+    max_rows: int = 80,
+) -> Optional[int]:
+    """Trova la riga di intestazione del foglio misure anche se sopra ci sono titoli/note."""
+    preview = pd.read_excel(
+        xls,
+        sheet_name=sheet_name,
+        header=None,
+        nrows=max_rows,
+    )
+
+    alias_norm = {
+        target: [normalize_text(a) for a in aliases]
+        for target, aliases in MEASURE_ALIASES.items()
+    }
+
+    for row_idx in range(len(preview)):
+        row_values = [
+            normalize_text(v)
+            for v in preview.iloc[row_idx].tolist()
+            if not pd.isna(v)
+        ]
+
+        has_year = any(a in row_values for a in alias_norm["year"])
+        has_month = any(a in row_values for a in alias_norm["month"])
+        has_day = any(a in row_values for a in alias_norm["day"])
+        has_hour = any(a in row_values for a in alias_norm["hour"])
+        has_power = any(a in row_values for a in alias_norm["power_kw"])
+
+        if has_year and has_month and has_day and has_hour and has_power:
+            return row_idx
+
+    return None
+
+
+def read_measure_sheet_with_detected_header(
+    xls: pd.ExcelFile,
+    sheet_name: str,
+) -> pd.DataFrame:
+    """Legge il foglio misure usando come header la riga rilevata automaticamente."""
+    header_row = find_measure_header_row(xls, sheet_name)
+
+    if header_row is None:
+        return pd.read_excel(xls, sheet_name=sheet_name)
+
+    df = pd.read_excel(
+        xls,
+        sheet_name=sheet_name,
+        header=header_row,
+    )
+
+    df = df.dropna(how="all").copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
 
 def detect_sheet_roles(xls: pd.ExcelFile) -> Tuple[Optional[str], Optional[str]]:
     config_sheet = None
     measure_sheet = None
 
+    config_name_tokens = [
+        "config",
+        "configurazione",
+        "impianto",
+        "plant",
+        "setup",
+        "anagrafica",
+    ]
+
     for sheet in xls.sheet_names:
-        sample = pd.read_excel(xls, sheet_name=sheet, nrows=20)
-        cols_norm = [normalize_text(c) for c in sample.columns]
-
-        has_measure_cols = (
-            any(c in cols_norm for c in ["anno", "year"])
-            and any(c in cols_norm for c in ["mese", "month"])
-            and any(c in cols_norm for c in ["giorno", "day"])
-            and any(c in cols_norm for c in ["ora", "hour"])
-        )
-
         sheet_name_norm = normalize_text(sheet)
 
-        if has_measure_cols and measure_sheet is None:
+        if config_sheet is None and any(token in sheet_name_norm for token in config_name_tokens):
+            config_sheet = sheet
+
+        if measure_sheet is None and find_measure_header_row(xls, sheet) is not None:
             measure_sheet = sheet
 
-        if config_sheet is None:
-            if any(token in sheet_name_norm for token in ["config", "impianto", "plant", "setup", "anagrafica"]):
-                config_sheet = sheet
-
     if config_sheet is None:
-        # fallback: il primo foglio che non sia misure
         for sheet in xls.sheet_names:
             if sheet != measure_sheet:
                 config_sheet = sheet
@@ -571,7 +638,7 @@ def prepare_measurements_from_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
     full_index = pd.date_range(
         start=df["timestamp_utc"].min(),
         end=df["timestamp_utc"].max(),
-        freq="H",
+        freq="h",
         tz="UTC",
     )
 
@@ -614,8 +681,11 @@ def load_plant_workbook(uploaded_file) -> Dict:
     measurements_df = None
     measurements_raw = None
     if measure_sheet is not None:
-        measurements_raw = pd.read_excel(xls, sheet_name=measure_sheet)
-        if not measurements_raw.empty:
+        measurements_raw = read_measure_sheet_with_detected_header(
+            xls=xls,
+            sheet_name=measure_sheet,
+        )
+        if measurements_raw is not None and not measurements_raw.empty:
             measurements_df = prepare_measurements_from_sheet(measurements_raw)
 
     return {
@@ -938,21 +1008,17 @@ def inject_tpa_style() -> None:
         """
         <style>
         .block-container {padding-top: 1.4rem; padding-bottom: 2rem;}
-        :root {--tpa-red:#9B1C1F; --tpa-red-dark:#761114; --tpa-green:#6BAA35; --tpa-ink:#1F2933; --tpa-muted:#5F6B7A; --tpa-soft:#F7F8F4;}
-        .tpa-hero {padding: 1.25rem 1.4rem; border-radius: 18px; background: linear-gradient(135deg, #761114 0%, #9B1C1F 48%, #6BAA35 100%); color: white; margin-bottom: 1rem; box-shadow: 0 10px 28px rgba(118, 17, 20, 0.18);}
+        .tpa-hero {padding: 1.25rem 1.4rem; border-radius: 18px; background: linear-gradient(135deg, #0f172a 0%, #164e63 55%, #166534 100%); color: white; margin-bottom: 1rem; box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);}
         .tpa-hero h1 {margin: 0; font-size: 2.05rem; letter-spacing: -0.02em;}
-        .tpa-hero p {margin: .35rem 0 0 0; color: rgba(255,255,255,.88); font-size: 1.02rem;}
-        .tpa-card {padding: 1rem 1.1rem; border: 1px solid rgba(155, 28, 31, .16); border-left: 4px solid #9B1C1F; border-radius: 16px; background: #FFFFFF; box-shadow: 0 4px 18px rgba(31, 41, 51, .06); min-height: 120px;}
-        .tpa-card h4 {margin: 0 0 .35rem 0; font-size: 1rem; color:#761114;}
-        .tpa-card p {margin: 0; color: #5F6B7A; font-size: .92rem;}
-        .tpa-kpi {padding: .9rem 1rem; border: 1px solid rgba(155, 28, 31, .15); border-radius: 16px; background: white; box-shadow: 0 4px 14px rgba(31, 41, 51, .05);}
-        .tpa-kpi-label {font-size: .82rem; color: #5F6B7A; margin-bottom: .25rem;}
-        .tpa-kpi-value {font-size: 1.55rem; font-weight: 700; color: #761114;}
-        .tpa-kpi-note {font-size: .78rem; color: #5F6B7A; margin-top: .18rem;}
-        .tpa-section-caption {color: #5F6B7A; margin-top: -0.35rem; margin-bottom: .7rem;}
-        .tpa-admin-spacer {height: 1.35rem;}
-        div.stButton > button[kind="primary"] {background-color:#9B1C1F; border-color:#9B1C1F;}
-        div.stButton > button[kind="primary"]:hover {background-color:#761114; border-color:#761114;}
+        .tpa-hero p {margin: .35rem 0 0 0; color: rgba(255,255,255,.86); font-size: 1.02rem;}
+        .tpa-card {padding: 1rem 1.1rem; border: 1px solid rgba(148, 163, 184, .35); border-radius: 16px; background: rgba(255, 255, 255, .72); box-shadow: 0 4px 18px rgba(15, 23, 42, .06); min-height: 120px;}
+        .tpa-card h4 {margin: 0 0 .35rem 0; font-size: 1rem;}
+        .tpa-card p {margin: 0; color: #475569; font-size: .92rem;}
+        .tpa-kpi {padding: .9rem 1rem; border: 1px solid rgba(148, 163, 184, .35); border-radius: 16px; background: white; box-shadow: 0 4px 14px rgba(15, 23, 42, .05);}
+        .tpa-kpi-label {font-size: .82rem; color: #64748b; margin-bottom: .25rem;}
+        .tpa-kpi-value {font-size: 1.55rem; font-weight: 700; color: #0f172a;}
+        .tpa-kpi-note {font-size: .78rem; color: #64748b; margin-top: .18rem;}
+        .tpa-section-caption {color: #64748b; margin-top: -0.35rem; margin-bottom: .7rem;}
         </style>
         """, unsafe_allow_html=True)
 
@@ -1195,7 +1261,6 @@ def app_ui() -> None:
             st.rerun()
 
     render_structure()
-    st.markdown("<div class='tpa-admin-spacer'></div>", unsafe_allow_html=True)
 
     if int(user["is_admin"]) == 1:
         with st.expander("Amministrazione Utenti", expanded=False):
@@ -1312,8 +1377,15 @@ def app_ui() -> None:
             st.metric("Righe misure", 0 if measurements_from_file is None else len(measurements_from_file))
         with info_cols[2]:
             st.metric("Periodo misure", format_upload_period(measurements_from_file))
-
-    st.markdown("### 5. Avvio Analisi")
+    btn_col, _ = st.columns([1, 4])
+    with btn_col:
+        submit = st.button(
+            "Avvia Analisi Prestazioni",
+            type="primary",
+            use_container_width=True,
+        )
+    if not submit:
+        return
     st.caption("Se il file misure è presente verrà eseguito il confronto Reale vs Atteso. In assenza di misure verrà generata una simulazione Atteso vs Baseline.")
     submit = st.button("Avvia Analisi Prestazioni", type="primary", use_container_width=True)
     if not submit:
