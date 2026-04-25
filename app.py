@@ -1377,17 +1377,18 @@ def app_ui() -> None:
             st.metric("Righe misure", 0 if measurements_from_file is None else len(measurements_from_file))
         with info_cols[2]:
             st.metric("Periodo misure", format_upload_period(measurements_from_file))
+    st.markdown("### 5. Avvio Analisi")
+    st.caption("Se il file misure è presente verrà eseguito il confronto Reale vs Atteso. In assenza di misure verrà generata una simulazione Atteso vs Baseline.")
+
     btn_col, _ = st.columns([1, 4])
     with btn_col:
         submit = st.button(
             "Avvia Analisi Prestazioni",
             type="primary",
             use_container_width=True,
+            key="btn_avvia_analisi_prestazioni",
         )
-    if not submit:
-        return
-    st.caption("Se il file misure è presente verrà eseguito il confronto Reale vs Atteso. In assenza di misure verrà generata una simulazione Atteso vs Baseline.")
-    submit = st.button("Avvia Analisi Prestazioni", type="primary", use_container_width=True)
+
     if not submit:
         return
 
