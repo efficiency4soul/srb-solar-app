@@ -1008,17 +1008,22 @@ def inject_tpa_style() -> None:
         """
         <style>
         .block-container {padding-top: 1.4rem; padding-bottom: 2rem;}
-        .tpa-hero {padding: 1.25rem 1.4rem; border-radius: 18px; background: linear-gradient(135deg, #0f172a 0%, #164e63 55%, #166534 100%); color: white; margin-bottom: 1rem; box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);}
+        :root {--tpa-red:#9B1C1F; --tpa-red-dark:#761114; --tpa-green:#6BAA35; --tpa-ink:#1F2933; --tpa-muted:#5F6B7A; --tpa-soft:#F7F8F4;}
+        .tpa-hero {padding: 1.25rem 1.4rem; border-radius: 18px; background: linear-gradient(135deg, #761114 0%, #9B1C1F 52%, #6BAA35 100%); color: white; margin-bottom: 1rem; box-shadow: 0 10px 28px rgba(118, 17, 20, 0.18);}
         .tpa-hero h1 {margin: 0; font-size: 2.05rem; letter-spacing: -0.02em;}
-        .tpa-hero p {margin: .35rem 0 0 0; color: rgba(255,255,255,.86); font-size: 1.02rem;}
-        .tpa-card {padding: 1rem 1.1rem; border: 1px solid rgba(148, 163, 184, .35); border-radius: 16px; background: rgba(255, 255, 255, .72); box-shadow: 0 4px 18px rgba(15, 23, 42, .06); min-height: 120px;}
-        .tpa-card h4 {margin: 0 0 .35rem 0; font-size: 1rem;}
-        .tpa-card p {margin: 0; color: #475569; font-size: .92rem;}
-        .tpa-kpi {padding: .9rem 1rem; border: 1px solid rgba(148, 163, 184, .35); border-radius: 16px; background: white; box-shadow: 0 4px 14px rgba(15, 23, 42, .05);}
-        .tpa-kpi-label {font-size: .82rem; color: #64748b; margin-bottom: .25rem;}
-        .tpa-kpi-value {font-size: 1.55rem; font-weight: 700; color: #0f172a;}
-        .tpa-kpi-note {font-size: .78rem; color: #64748b; margin-top: .18rem;}
-        .tpa-section-caption {color: #64748b; margin-top: -0.35rem; margin-bottom: .7rem;}
+        .tpa-hero p {margin: .35rem 0 0 0; color: rgba(255,255,255,.88); font-size: 1.02rem;}
+        .tpa-card {padding: 1rem 1.1rem; border: 1px solid rgba(155, 28, 31, .16); border-left: 4px solid #9B1C1F; border-radius: 16px; background: #FFFFFF; box-shadow: 0 4px 18px rgba(31, 41, 51, .06); min-height: 120px;}
+        .tpa-card h4 {margin: 0 0 .35rem 0; font-size: 1rem; color:#761114;}
+        .tpa-card p {margin: 0; color: #5F6B7A; font-size: .92rem;}
+        .tpa-kpi {padding: .9rem 1rem; border: 1px solid rgba(155, 28, 31, .15); border-radius: 16px; background: white; box-shadow: 0 4px 14px rgba(31, 41, 51, .05); min-height: 92px;}
+        .tpa-kpi-label {font-size: .82rem; color: #5F6B7A; margin-bottom: .25rem;}
+        .tpa-kpi-value {font-size: 1.45rem; font-weight: 700; color: #761114;}
+        .tpa-kpi-note {font-size: .78rem; color: #5F6B7A; margin-top: .18rem;}
+        .tpa-section-caption {color: #5F6B7A; margin-top: -0.35rem; margin-bottom: .7rem;}
+        .tpa-admin-spacer {height: 1.35rem;}
+        .tpa-small-spacer {height: .9rem;}
+        div.stButton > button[kind="primary"] {background-color:#9B1C1F; border-color:#9B1C1F;}
+        div.stButton > button[kind="primary"]:hover {background-color:#761114; border-color:#761114;}
         </style>
         """, unsafe_allow_html=True)
 
@@ -1088,6 +1093,34 @@ def apply_prefill_to_widget_state(prefill: Dict) -> None:
 
 def get_default_prefill() -> Dict:
     return {"codice_impianto": "SRB_xxx", "lat": 41.8927524, "lon": 12.4853054, "peakpower": 1.0, "loss": 14.0, "pvtechchoice": "crystSi", "mountingplace": "free", "optimalangles": False, "angle": 30.0, "aspect": 0.0, "tracking_mode": "fixed", "raddatabase": "PVGIS-SARAH3", "startyear": 2005, "endyear": 2023, "usehorizon": True, "components": True}
+
+
+def reset_analysis_session() -> None:
+    """Ripristina i default UI e rimuove il file caricato dalla sessione."""
+    for key in ["parsed_workbook", "last_upload_token"]:
+        st.session_state.pop(key, None)
+    st.session_state["plant_prefill"] = get_default_prefill()
+    st.session_state["ui_refresh_id"] = st.session_state.get("ui_refresh_id", 0) + 1
+
+
+def render_file_status_cards(parsed_workbook: Optional[Dict], measurements_df: Optional[pd.DataFrame]) -> None:
+    """Mostra i dati del file caricato con card compatte, allineate allo stile KPI."""
+    if parsed_workbook is None:
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: render_kpi_card("Sito da file", "Non disponibile", "Nessun file caricato")
+        with c2: render_kpi_card("Foglio misure", "Non disponibile", "Nessun file caricato")
+        with c3: render_kpi_card("Righe misure", "Non disponibile", "Nessun file caricato")
+        with c4: render_kpi_card("Periodo misure", "Non disponibile", "Nessun file caricato")
+        return
+
+    measure_sheet = parsed_workbook.get("measure_sheet_name") or "Non disponibile"
+    rows = "Non disponibile" if measurements_df is None else fmt_num(len(measurements_df), 0, "")
+    period = format_upload_period(measurements_df) if measurements_df is not None else "Non disponibile"
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: render_kpi_card("Sito da file", str(parsed_workbook["plant_cfg"].get("codice_impianto", "Non disponibile")), "Configurazione caricata")
+    with c2: render_kpi_card("Foglio misure", str(measure_sheet), "Rilevamento misure")
+    with c3: render_kpi_card("Righe misure", str(rows), "Dopo riempimento buchi")
+    with c4: render_kpi_card("Periodo misure", str(period), "Intervallo rilevato")
 
 
 def format_upload_period(measurements_df: Optional[pd.DataFrame]) -> str:
@@ -1252,15 +1285,22 @@ def app_ui() -> None:
     user = st.session_state["user"]
     render_hero(user)
 
-    top_left, top_right = st.columns([5, 1])
+    top_left, top_actions = st.columns([4, 2])
     with top_left:
         st.caption("Analisi delle prestazioni fotovoltaiche per siti con impianti FV.")
-    with top_right:
-        if st.button("Logout", use_container_width=True):
-            st.session_state.clear()
-            st.rerun()
+    with top_actions:
+        action_cols = st.columns(2)
+        with action_cols[0]:
+            if st.button("Nuova richiesta", use_container_width=True, key="btn_nuova_richiesta"):
+                reset_analysis_session()
+                st.rerun()
+        with action_cols[1]:
+            if st.button("Logout", use_container_width=True, key="btn_logout"):
+                st.session_state.clear()
+                st.rerun()
 
     render_structure()
+    st.markdown("<div class='tpa-admin-spacer'></div>", unsafe_allow_html=True)
 
     if int(user["is_admin"]) == 1:
         with st.expander("Amministrazione Utenti", expanded=False):
@@ -1348,7 +1388,7 @@ def app_ui() -> None:
 
     st.markdown("### 4. Caricamento Dati")
     st.markdown("<div class='tpa-section-caption'>Carica un file Excel con configurazione sito e, se disponibili, misure orarie di produzione. Il caricamento non avvia automaticamente l'analisi.</div>", unsafe_allow_html=True)
-    uploaded_plant_file = st.file_uploader("Trascina qui il file Excel o selezionalo dal computer", type=["xlsx", "xls"], key="plant_workbook_uploader")
+    uploaded_plant_file = st.file_uploader("Trascina qui il file Excel o selezionalo dal computer", type=["xlsx", "xls"], key=f"plant_workbook_uploader_{ui_key}")
     if uploaded_plant_file is not None:
         token = f"{uploaded_plant_file.name}_{uploaded_plant_file.size}"
         if st.session_state.get("last_upload_token") != token:
@@ -1370,13 +1410,7 @@ def app_ui() -> None:
     measurements_raw_sheet = parsed_workbook.get("measurements_raw_df") if parsed_workbook else None
     if parsed_workbook is not None:
         st.success(f"File pronto. Foglio configurazione: {parsed_workbook['config_sheet_name']}. " + (f"Foglio misure: {parsed_workbook['measure_sheet_name']}." if parsed_workbook.get("measure_sheet_name") is not None else "Foglio misure non presente: verrà eseguito solo il confronto atteso vs baseline."))
-        info_cols = st.columns(3)
-        with info_cols[0]:
-            st.metric("Sito da file", str(parsed_workbook["plant_cfg"].get("codice_impianto", "n.d.")))
-        with info_cols[1]:
-            st.metric("Righe misure", 0 if measurements_from_file is None else len(measurements_from_file))
-        with info_cols[2]:
-            st.metric("Periodo misure", format_upload_period(measurements_from_file))
+    render_file_status_cards(parsed_workbook, measurements_from_file)
     st.markdown("### 5. Avvio Analisi")
     st.caption("Se il file misure è presente verrà eseguito il confronto Reale vs Atteso. In assenza di misure verrà generata una simulazione Atteso vs Baseline.")
 
@@ -1452,6 +1486,7 @@ def app_ui() -> None:
             with k2: render_kpi_card("Baseline Storica", fmt_num(metric_value(kpi_df, "baseline_energy_total_kwh"), 1, " kWh"), "PVGIS percentile")
             with k3: render_kpi_card("Delta vs Baseline", fmt_num(metric_value(kpi_df, "mean_delta_expected_vs_baseline_pct"), 1, "%"), "Atteso recente vs storico")
             with k4: render_kpi_card("Ore Analizzate", fmt_num(metric_value(kpi_df, "rows_comparison"), 0, ""), "Periodo selezionato")
+        st.markdown("<div class='tpa-small-spacer'></div>", unsafe_allow_html=True)
         render_kpi_legend(measurements_present)
         with st.expander("Tabella indicatori tecnici", expanded=measurements_present):
             st.dataframe(kpi_df, use_container_width=True)
